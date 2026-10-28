@@ -297,6 +297,55 @@ static void _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
     }
 }
 // ====================================================================================================
+static struct execEntryHash *_callEndpoint( struct RunTime *r, uint32_t addr )
+
+/* Find the instruction record for one end of a call. If that address was never recorded as     */
+/* executed (e.g. an exception entry/return address), make a stand-alone record for it that is  */
+/* not added to the instruction table, so it doesn't show up as executed code.                  */
+
+{
+    struct execEntryHash *h;
+    struct nameEntry n;
+
+    HASH_FIND_INT( r->insthead, &addr, h );
+
+    if ( h )
+    {
+        return h;
+    }
+
+    h = ( struct execEntryHash * )calloc( 1, sizeof( struct execEntryHash ) );
+    MEMCHECK( h, NULL );
+    h->addr = addr;
+
+    if ( SymbolLookup( r->s, addr, &n ) )
+    {
+        h->fileindex     = n.fileindex;
+        h->functionindex = n.functionindex;
+        h->line          = n.line;
+    }
+    else
+    {
+        h->fileindex     = NO_FILE;
+        h->functionindex = NO_FUNCTION;
+        h->line          = NO_LINE;
+    }
+
+    return h;
+}
+// ====================================================================================================
+static void _resolveCalls( struct RunTime *r )
+
+/* The DOT and KCacheGrind writers need the source and destination records of every call */
+
+{
+    for ( struct subcall *s = r->subhead; s; s = s->hh.next )
+    {
+        s->srch = _callEndpoint( r, s->sig.src );
+        s->dsth = _callEndpoint( r, s->sig.dst );
+    }
+}
+// ====================================================================================================
 static void _handleInstruction( struct RunTime *r, bool actioned )
 
 {
@@ -1013,6 +1062,8 @@ int main( int argc, char *argv[] )
 
     if ( HASH_COUNT( _r.subhead ) )
     {
+        _resolveCalls( &_r );
+
         if ( ext_ff_outputDot( _r.options->dotfile, _r.subhead, _r.s ) )
         {
             genericsReport( V_INFO, "Output DOT" EOL );
@@ -1042,6 +1093,10 @@ int main( int argc, char *argv[] )
                 genericsExit( -1, "Failed to output profile" EOL );
             }
         }
+    }
+    else
+    {
+        genericsReport( V_WARN, "No calls recorded, so no profile written" EOL );
     }
 
     return OK;

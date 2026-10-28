@@ -93,6 +93,11 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
     /* Sort according to addresses visited. */
 
     c = fopen( dotfile, "w" );
+
+    if ( !c )
+    {
+        return false;
+    }
     fprintf( c, "graph calls\n{\n  overlap=true; splines=true; size=\"7.75,10.25\"; orientation=portrait; sep=0.1; nodesep=1;\n" );
 
     HASH_SORT( subcallList, _calls_src_sort_fn );
@@ -151,6 +156,11 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     }
 
     c = fopen( profile, "w" );
+
+    if ( !c )
+    {
+        return false;
+    }
     fprintf( c, "# callgrind format\n" );
 
     if ( includeVisits )
