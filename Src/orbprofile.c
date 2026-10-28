@@ -854,6 +854,25 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     }
 }
 // ====================================================================================================
+static void _queueBlock( struct RunTime *r )
+
+/* Hand the block at wp (already filled in) to the processing thread */
+
+{
+    pthread_mutex_lock( &r->dataForClients_m );
+    int nwp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
+
+    if ( nwp == r->rp )
+    {
+        pthread_mutex_unlock( &r->dataForClients_m );
+        genericsExit( -1, "Overflow: decoding can't keep up, use a shorter -I or less trace data" EOL );
+    }
+
+    r->wp = nwp;
+    pthread_cond_signal( &r->dataForClients );
+    pthread_mutex_unlock( &r->dataForClients_m );
+}
+// ====================================================================================================
 static void *_processBlocks( void *params )
 
 /* Generic block processor for received data. This runs in a task parallel to the receiver and *
@@ -864,48 +883,38 @@ static void *_processBlocks( void *params )
 
     while ( true )
     {
-        pthread_cond_wait( &r->dataForClients, &r->dataForClients_m );
+        /* Wait (with the mutex held, as pthread_cond_wait requires) until a block is queued */
+        pthread_mutex_lock( &r->dataForClients_m );
 
-        if ( r->rp != ( volatile int )r->wp )
+        while ( r->rp == r->wp )
         {
-            genericsReport( V_DEBUG, "RXED Packet of %d bytes" EOL, r->rawBlock[r->rp].fillLevel );
-
-            /* Check to see if we've finished (a zero length packet */
-            if ( !r->rawBlock[r->rp].fillLevel )
-            {
-                break;
-            }
-
-#ifdef DUMP_BLOCK
-            uint8_t *c = r->rawBlock[r->rp].buffer;
-            uint32_t y = r->rawBlock[r->rp].fillLevel;
-
-            DBG_OUT( EOL );
-
-            while ( y-- )
-            {
-                DBG_OUT( "%02X ", *c++ );
-
-                if ( !( y % 16 ) )
-                {
-                    DBG_OUT( EOL );
-                }
-            }
-
-#endif
-
-            if ( PROT_OFLOW == r->options->protocol )
-            {
-                OFLOWPump( &_r.c, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel, _OFLOWpacketRxed, &_r );
-            }
-            else
-            {
-                /* Pump all of the data through the protocol handler */
-                TRACEDecoderPump( &r->i, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel, _traceCB, &_r );
-            }
-
-            r->rp = ( r->rp + 1 ) % NUM_RAW_BLOCKS;
+            pthread_cond_wait( &r->dataForClients, &r->dataForClients_m );
         }
+
+        pthread_mutex_unlock( &r->dataForClients_m );
+
+        struct dataBlock *b = &r->rawBlock[r->rp];
+        genericsReport( V_DEBUG, "RXED Packet of %d bytes" EOL, ( int )b->fillLevel );
+
+        /* A zero length block marks the end of the data */
+        if ( b->fillLevel <= 0 )
+        {
+            break;
+        }
+
+        if ( PROT_OFLOW == r->options->protocol )
+        {
+            OFLOWPump( &_r.c, b->buffer, b->fillLevel, _OFLOWpacketRxed, &_r );
+        }
+        else
+        {
+            /* Pump all of the data through the protocol handler */
+            TRACEDecoderPump( &r->i, b->buffer, b->fillLevel, _traceCB, &_r );
+        }
+
+        pthread_mutex_lock( &r->dataForClients_m );
+        r->rp = ( r->rp + 1 ) % NUM_RAW_BLOCKS;
+        pthread_mutex_unlock( &r->dataForClients_m );
     }
 
     return NULL;
@@ -964,6 +973,8 @@ int main( int argc, char *argv[] )
     TRACEDecoderInit( &_r.i, _r.options->tProtocol, !_r.options->noaltAddr, genericsReport );
     OFLOWInit( &_r.c );
 
+    bool processThreadStarted = false;
+
     while ( !_r.ending )
     {
         if ( _r.options->file != NULL )
@@ -1015,8 +1026,12 @@ int main( int argc, char *argv[] )
 
         _r.intervalBytes = 0;
 
-        /* Now start the result processing task */
-        pthread_create( &_r.processThread, NULL, &_processBlocks, &_r );
+        /* Start the result processing task (once: we may come round here again after a reconnect) */
+        if ( !processThreadStarted )
+        {
+            pthread_create( &_r.processThread, NULL, &_processBlocks, &_r );
+            processThreadStarted = true;
+        }
 
         /* ----------------------------------------------------------------------------- */
         /* This is the main active loop...only break out of this when ending or on error */
@@ -1035,44 +1050,27 @@ int main( int argc, char *argv[] )
 
             if ( ( result == RECEIVE_RESULT_EOF ) || ( result == RECEIVE_RESULT_ERROR ) )
             {
+                if ( ( result == RECEIVE_RESULT_EOF ) && ( _r.options->file ) )
+                {
+                    /* End of the input file: nothing more will come */
+                    _r.ending = true;
+                }
+
                 break;
             }
 
-            if ( rxBlock->fillLevel <= 0 )
+            /* A timeout (no data for a moment) is not the end of the connection, just carry on */
+            if ( rxBlock->fillLevel > 0 )
             {
-                /* We are at EOF (Probably the descriptor closed) */
-                break;
+                /* ...record the fact that we received some data */
+                _r.intervalBytes += rxBlock->fillLevel;
+                _queueBlock( &_r );
             }
 
-            /* ...record the fact that we received some data */
-            _r.intervalBytes += rxBlock->fillLevel;
-
-            int nwp = ( _r.wp + 1 ) % NUM_RAW_BLOCKS;
-
-            if ( nwp == ( volatile int )_r.rp )
-            {
-                genericsExit( -1, "Overflow" EOL );
-            }
-
-            _r.wp = nwp;
-            pthread_cond_signal( &_r.dataForClients );
-
-            /* Update the intervals */
+            /* Stop once the sample interval is over */
             if ( ( ( volatile bool ) _r.sampling ) && ( ( genericsTimestampmS() - ( volatile uint32_t )_r.starttime ) > _r.options->sampleDuration ) )
             {
                 _r.ending = true;
-
-                /* Post an empty data packet to flag to packet processor that it's done */
-                int nwp = ( _r.wp + 1 ) % NUM_RAW_BLOCKS;
-
-                if ( nwp == ( volatile int )_r.rp )
-                {
-                    genericsExit( -1, "Overflow" EOL );
-                }
-
-                _r.rawBlock[_r.wp].fillLevel = 0;
-                _r.wp = nwp;
-                pthread_cond_signal( &_r.dataForClients );
             }
         }
 
@@ -1080,8 +1078,13 @@ int main( int argc, char *argv[] )
         free( stream );
     }
 
-    /* Wait for data processing to be completed */
-    pthread_join( _r.processThread, NULL );
+    /* Post an empty block to tell the processing thread it's done, then wait for it */
+    if ( processThreadStarted )
+    {
+        _r.rawBlock[_r.wp].fillLevel = 0;
+        _queueBlock( &_r );
+        pthread_join( _r.processThread, NULL );
+    }
 
     /* Data are collected, now process and report */
     genericsReport( V_INFO, "Received %d raw sample bytes, %ld function changes, %ld distinct addresses" EOL,
