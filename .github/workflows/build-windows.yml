@@ -1,8 +1,9 @@
 name: Build Windows binaries
 
 on:
-  - push
-  - pull_request
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   win64:
@@ -43,13 +44,26 @@ jobs:
       - run: make -j4 install
         working-directory: ./libusb/build
 
-      - run: "export PKG_CONFIG_PATH=`realpath ../libusb/install/lib/pkgconfig` && meson setup ./build --prefix A:/"
+      # Newer GCC warns about code in the bundled libdwarf, which is built with -Werror.
+      - run: "export PKG_CONFIG_PATH=`realpath ../libusb/install/lib/pkgconfig` && meson setup ./build --prefix A:/ -Dwerror=false -Dlibdwarf:werror=false"
         working-directory: ./orbuculum
       - run: ninja -C ./build
         working-directory: ./orbuculum
       - run: meson install -C ./build --destdir ./install --strip
         working-directory: ./orbuculum
       - run: cp ./libusb/install/bin/libusb-1.0.dll ./orbuculum/build/install/bin
+      - name: Bundle MinGW DLLs
+        working-directory: ./orbuculum/build/install/bin
+        run: |
+          # Copy every MinGW runtime DLL the tools need, so they run without MSYS2 installed.
+          for i in 1 2 3; do
+            for f in *.exe *.dll; do
+              ldd "$f" | awk '/\/mingw64\// {print $3}' | while read d; do
+                [ -f "$(basename "$d")" ] || cp -v "$d" .
+              done
+            done
+          done
+          ls -la
       - uses: actions/upload-artifact@v4
         with:
           name: orbuculum-win64
