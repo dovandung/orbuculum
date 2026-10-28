@@ -1079,8 +1079,10 @@ int main( int argc, char *argv[] )
                 _r.intervalBytes += got;
             }
 
-            /* Pass the block on when it's full, or when the data pause (so decoding can start) */
-            if ( ( rxBlock->fillLevel >= TRANSFER_SIZE ) || ( ( got == 0 ) && ( rxBlock->fillLevel > 0 ) ) )
+            /* Pass the block on when it's full, or, when the data pause, only if the decoder has */
+            /* nothing to do (otherwise half-empty blocks would use up the buffer).               */
+            if ( ( rxBlock->fillLevel >= TRANSFER_SIZE ) ||
+                    ( ( got == 0 ) && ( rxBlock->fillLevel > 0 ) && ( ( volatile int )_r.rp == _r.wp ) ) )
             {
                 if ( !_queueBlock( &_r, false ) )
                 {
