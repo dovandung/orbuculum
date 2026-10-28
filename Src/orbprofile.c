@@ -900,7 +900,7 @@ int main( int argc, char *argv[] )
             {
                 stream = streamCreateSocket( _r.options->server, _r.options->port );
 
-                if ( !stream )
+                if ( stream )
                 {
                     break;
                 }
