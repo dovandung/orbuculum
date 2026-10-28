@@ -37,8 +37,14 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 /* How many transfer buffers from the source to allocate */
 #define NUM_RAW_BLOCKS (1000)
 
+#ifdef ORBPROFILE_DEBUG
 #define DBG_OUT(...) fprintf(stderr,__VA_ARGS__)
-//#define DBG_OUT(...)
+#else
+#define DBG_OUT(...)
+#endif
+
+/* Instructions skipped because the trace position wasn't known (e.g. after an indirect branch) */
+static uint64_t _lostInstructions;
 
 struct _subcallAccount
 {
@@ -257,44 +263,57 @@ static void _returnEvent( struct RunTime *r, uint32_t to )
     }
 }
 // ====================================================================================================
-static void _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntryHash **h )
+static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntryHash **h )
+
+/* Find the record for this instruction address, or create it. Returns false if the address */
+/* isn't a known instruction (unknown position after an indirect branch, code outside the   */
+/* ELF file, or a mis-decode), so the caller can skip it instead of crashing or exiting.    */
+
 {
     struct nameEntry n;
 
     HASH_FIND_INT( r->insthead, &addr, *h );
 
-    if ( !( *h ) )
+    if ( *h )
     {
-        /* We don't have this address captured yet, do it now */
-        if ( SymbolLookup( r->s, r->op.workingAddr, &n ) )
-        {
-            if ( n.assyLine == ASSY_NOT_FOUND )
-            {
-                genericsExit( -1, "No assembly for function at address %08x, %s" EOL, r->op.workingAddr, SymbolFunction( r->s, n.functionindex ) );
-            }
-
-            *h = calloc( 1, sizeof( struct execEntryHash ) );
-            MEMCHECKV( *h );
-
-            ( *h )->addr          = r->op.workingAddr;
-            ( *h )->fileindex     = n.fileindex;
-            ( *h )->line          = n.line;
-            ( *h )->functionindex = n.functionindex;
-            ( *h )->isJump        = n.assy[n.assyLine].isJump;
-            ( *h )->isSubCall     = n.assy[n.assyLine].isSubCall;
-            ( *h )->isReturn      = n.assy[n.assyLine].isReturn;
-            ( *h )->jumpdest      = n.assy[n.assyLine].jumpdest;
-            ( *h )->is4Byte       = n.assy[n.assyLine].is4Byte;
-            ( *h )->codes         = n.assy[n.assyLine].codes;
-            ( *h )->assyText      = n.assy[n.assyLine].lineText;
-        }
-        else
-        {
-            genericsExit( -1, "No symbol for address %08x" EOL, r->op.workingAddr );
-        }
-
-        HASH_ADD_INT( r->insthead, addr, ( *h ) );
+        return true;
     }
+
+    if ( ( addr & SPECIALS_MASK ) == SPECIALS_MASK )
+    {
+        /* Placeholder address (e.g. NO_DESTADDRESS after BLX rx): position unknown */
+        return false;
+    }
+
+    if ( !SymbolLookup( r->s, addr, &n ) )
+    {
+        genericsReport( V_DEBUG, "No symbol for address %08x" EOL, addr );
+        return false;
+    }
+
+    if ( ( !n.assy ) || ( n.assyLine == ASSY_NOT_FOUND ) )
+    {
+        genericsReport( V_DEBUG, "No assembly for address %08x, %s" EOL, addr, SymbolFunction( r->s, n.functionindex ) );
+        return false;
+    }
+
+    *h = calloc( 1, sizeof( struct execEntryHash ) );
+    MEMCHECK( *h, false );
+
+    ( *h )->addr          = addr;
+    ( *h )->fileindex     = n.fileindex;
+    ( *h )->line          = n.line;
+    ( *h )->functionindex = n.functionindex;
+    ( *h )->isJump        = n.assy[n.assyLine].isJump;
+    ( *h )->isSubCall     = n.assy[n.assyLine].isSubCall;
+    ( *h )->isReturn      = n.assy[n.assyLine].isReturn;
+    ( *h )->jumpdest      = n.assy[n.assyLine].jumpdest;
+    ( *h )->is4Byte       = n.assy[n.assyLine].is4Byte;
+    ( *h )->codes         = n.assy[n.assyLine].codes;
+    ( *h )->assyText      = n.assy[n.assyLine].lineText;
+
+    HASH_ADD_INT( r->insthead, addr, ( *h ) );
+    return true;
 }
 // ====================================================================================================
 static struct execEntryHash *_callEndpoint( struct RunTime *r, uint32_t addr )
@@ -355,7 +374,15 @@ static void _handleInstruction( struct RunTime *r, bool actioned )
     /* ------------------------------------------------------------------------------------*/
 
     r->op.oldh = r->op.h;
-    _hashFindOrCreate( r, r->op.workingAddr, &r->op.h );
+
+    if ( !_hashFindOrCreate( r, r->op.workingAddr, &r->op.h ) )
+    {
+        /* Position unknown: count it as lost and wait for the next address from the trace. */
+        /* The interrupt placeholder record has no jump/call/return flags, so it is inert.  */
+        _lostInstructions++;
+        r->op.h = r->op.inth;
+        return;
+    }
 
     //    if ( r->op.oldh ) DBG_OUT( "%4d,%4d %4d %s%s%c %s", r->op.h->functionindex, ( r->op.h ? r->op.oldh->functionindex : 0 ),  r->op.h->fileindex,
     //                               ( r->op.h->isJump ) ? "J" : " ", ( r->op.h->isSubCall ) ? "S" : r->op.h->isReturn ? "R" : " ", ( actioned ) ? ( r->op.h->is4Byte ? 'X' : 'x' ) : '-',
@@ -1059,6 +1086,11 @@ int main( int argc, char *argv[] )
     /* Data are collected, now process and report */
     genericsReport( V_INFO, "Received %d raw sample bytes, %ld function changes, %ld distinct addresses" EOL,
                     _r.intervalBytes, HASH_COUNT( _r.subhead ), HASH_COUNT( _r.insthead ) );
+
+    if ( _lostInstructions )
+    {
+        genericsReport( V_INFO, "%" PRIu64 " instructions skipped where the trace position was not known" EOL, _lostInstructions );
+    }
 
     if ( HASH_COUNT( _r.subhead ) )
     {
