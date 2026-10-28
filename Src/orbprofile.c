@@ -201,10 +201,12 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
 
     r->substacklen++;
 
+#ifdef ORBPROFILE_DEBUG
     for ( uint32_t g = 0; g < r->substacklen; g++ )
     {
         putchar( ' ' );
     }
+#endif
 
     DBG_OUT( "INC:%3d %08x -> %08x" EOL, r->substacklen, retAddr, to );
 }
@@ -236,10 +238,12 @@ static void _returnEvent( struct RunTime *r, uint32_t to )
         /* The -1th entry was the last written, so see if that is back far enough */
         r->substacklen--;
 
+#ifdef ORBPROFILE_DEBUG
         for ( uint32_t g = 0; g < r->substacklen + 1; g++ )
         {
             putchar( ' ' );
         }
+#endif
 
         DBG_OUT( " DEC:%3d %08x " EOL, r->substacklen + 1, r->substack[r->substacklen].sig.src );
         HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
@@ -854,23 +858,27 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     }
 }
 // ====================================================================================================
-static void _queueBlock( struct RunTime *r )
+static bool _queueBlock( struct RunTime *r, bool force )
 
-/* Hand the block at wp (already filled in) to the processing thread */
+/* Hand the block at wp (already filled in) to the processing thread and start a new, empty one. */
+/* One slot is always kept free for the end-of-data block, which is queued with force set.       */
+/* Returns false if the buffer is full (decoding has fallen too far behind).                     */
 
 {
     pthread_mutex_lock( &r->dataForClients_m );
     int nwp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
 
-    if ( nwp == r->rp )
+    if ( ( ( nwp + 1 ) % NUM_RAW_BLOCKS == r->rp ) && ( !force ) )
     {
         pthread_mutex_unlock( &r->dataForClients_m );
-        genericsExit( -1, "Overflow: decoding can't keep up, use a shorter -I or less trace data" EOL );
+        return false;
     }
 
     r->wp = nwp;
+    r->rawBlock[r->wp].fillLevel = 0;
     pthread_cond_signal( &r->dataForClients );
     pthread_mutex_unlock( &r->dataForClients_m );
+    return true;
 }
 // ====================================================================================================
 static void *_processBlocks( void *params )
@@ -1044,9 +1052,14 @@ int main( int argc, char *argv[] )
             tv.tv_usec  = TICK_TIME_MS * 1000;
 
 
+            /* Data are gathered into large blocks: the decoder is usually slower than the trace */
+            /* (every instruction is decoded), so the buffer (NUM_RAW_BLOCKS x TRANSFER_SIZE)     */
+            /* holds the capture while decoding catches up.                                     */
             struct dataBlock *rxBlock = &_r.rawBlock[_r.wp];
+            size_t got = 0;
 
-            enum ReceiveResult result = stream->receive( stream, rxBlock->buffer, TRANSFER_SIZE, &tv, ( size_t * )&rxBlock->fillLevel );
+            enum ReceiveResult result = stream->receive( stream, rxBlock->buffer + rxBlock->fillLevel,
+                                        TRANSFER_SIZE - rxBlock->fillLevel, &tv, &got );
 
             if ( ( result == RECEIVE_RESULT_EOF ) || ( result == RECEIVE_RESULT_ERROR ) )
             {
@@ -1060,11 +1073,22 @@ int main( int argc, char *argv[] )
             }
 
             /* A timeout (no data for a moment) is not the end of the connection, just carry on */
-            if ( rxBlock->fillLevel > 0 )
+            if ( got > 0 )
             {
-                /* ...record the fact that we received some data */
-                _r.intervalBytes += rxBlock->fillLevel;
-                _queueBlock( &_r );
+                rxBlock->fillLevel += got;
+                _r.intervalBytes += got;
+            }
+
+            /* Pass the block on when it's full, or when the data pause (so decoding can start) */
+            if ( ( rxBlock->fillLevel >= TRANSFER_SIZE ) || ( ( got == 0 ) && ( rxBlock->fillLevel > 0 ) ) )
+            {
+                if ( !_queueBlock( &_r, false ) )
+                {
+                    genericsReport( V_WARN, "Capture buffer full after %u ms: stopping capture and decoding what was received" EOL,
+                                    _r.sampling ? genericsTimestampmS() - _r.starttime : 0 );
+                    rxBlock->fillLevel = 0;
+                    _r.ending = true;
+                }
             }
 
             /* Stop once the sample interval is over */
@@ -1081,8 +1105,15 @@ int main( int argc, char *argv[] )
     /* Post an empty block to tell the processing thread it's done, then wait for it */
     if ( processThreadStarted )
     {
+        /* Pass on any partly filled block (there's always room for this one plus the end block) */
+        if ( _r.rawBlock[_r.wp].fillLevel > 0 )
+        {
+            _queueBlock( &_r, true );
+        }
+
+        genericsReport( V_INFO, "Capture done (%" PRIu64 " bytes), finishing decoding..." EOL, _r.intervalBytes );
         _r.rawBlock[_r.wp].fillLevel = 0;
-        _queueBlock( &_r );
+        _queueBlock( &_r, true );
         pthread_join( _r.processThread, NULL );
     }
 
