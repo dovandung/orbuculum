@@ -27,6 +27,7 @@ jobs:
             mingw-w64-x86_64-meson
             mingw-w64-x86_64-autotools
             mingw-w64-x86_64-ca-certificates
+            mingw-w64-x86_64-gdb
       - uses: actions/checkout@v4
         with:
           path: ./orbuculum
@@ -70,3 +71,25 @@ jobs:
           path: ./orbuculum/build/install/**/*.*
           if-no-files-found: error
 
+      # Debug kit: tools with debug symbols (not stripped) plus gdb, to get a backtrace of a crash:
+      #   gdb -batch -ex run -ex bt --args orbprofile.exe <options>
+      - name: Debug kit
+        run: |
+          mkdir -p ./debugkit
+          cp ./orbuculum/build/*.exe ./debugkit/
+          cp ./orbuculum/build/install/bin/*.dll ./debugkit/
+          cp /mingw64/bin/gdb.exe ./debugkit/
+          cd ./debugkit
+          for i in 1 2 3; do
+            for f in *.exe *.dll; do
+              ldd "$f" | awk '/\/mingw64\// {print $3}' | while read d; do
+                [ -f "$(basename "$d")" ] || cp "$d" .
+              done
+            done
+          done
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbuculum-win64-debug
+          path: ./debugkit/*
+          if-no-files-found: error
