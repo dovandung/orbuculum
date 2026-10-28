@@ -22,6 +22,7 @@ jobs:
             mingw-w64-x86_64-zeromq
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-libelf
+            mingw-w64-x86_64-capstone
             git
             zip
             mingw-w64-x86_64-meson
@@ -53,6 +54,13 @@ jobs:
       - run: meson install -C ./build --destdir ./install --strip
         working-directory: ./orbuculum
       - run: cp ./libusb/install/bin/libusb-1.0.dll ./orbuculum/build/install/bin
+      - name: Check all tools were built
+        working-directory: ./orbuculum/build/install/bin
+        run: |
+          for t in orbuculum orbcat orbtop orbmortem orbprofile orbstat orbtrace orbdump orbzmq orblcd; do
+            [ -f $t.exe ] || { echo "::error::$t.exe was not built"; missing=1; }
+          done
+          [ -z "$missing" ]
       - name: Bundle MinGW DLLs
         working-directory: ./orbuculum/build/install/bin
         run: |
