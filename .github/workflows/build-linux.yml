@@ -1,8 +1,8 @@
 name: Build Linux binaries
 
+# Only built on request (Actions tab -> Run workflow); pushes build Windows only.
 on:
-  - push
-  - pull_request
+  workflow_dispatch:
 
 jobs:
   linux:
