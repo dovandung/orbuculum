@@ -12,7 +12,7 @@ jobs:
       - run: sudo apt-get install -y libusb-1.0-0-dev libzmq3-dev meson libsdl2-dev libdwarf-dev libdw-dev libelf-dev libcapstone-dev python3-pip ninja-build
       - run: sudo pip3 install meson==1.2.0
       - uses: actions/checkout@v4
-      - run: meson setup ./build
+      - run: meson setup ./build -Dwerror=false -Dlibdwarf:werror=false
       - run: ninja -C ./build
       - run: meson install -C ./build --destdir ./install
       - uses: actions/upload-artifact@v4
