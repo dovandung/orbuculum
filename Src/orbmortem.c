@@ -541,7 +541,11 @@ static bool _holdResolve( struct RunTime *r )
 
     for ( unsigned int i = 0; ( f = symbolFunctionIndex( r->s, i ) ); i++ )
     {
-        if ( ( f->funcname ) && ( !f->isinline ) && ( !strcmp( f->funcname, a ) ) )
+        /* Skip declarations (e.g. from a header, in another file's debug info) and inline */
+        /* templates: they have no code of their own.                                     */
+        if ( ( f->funcname ) && ( !f->isinline ) && ( !strcmp( f->funcname, a ) ) &&
+                ( f->lowaddr ) && ( f->highaddr >= f->lowaddr ) &&
+                ( symbolCodeAt( r->s, f->lowaddr & ~1UL, NULL ) ) )
         {
             r->holdLow  = f->lowaddr & ~1UL;
             r->holdHigh = f->highaddr;
@@ -762,7 +766,12 @@ static bool _rxAdd( struct RunTime *r, uint8_t c )
     r->newTotalBytes ++;
 
     r->pmBuffer[r->wp] = c;
-    uint32_t nwp = ( r->wp + 1 ) % r->options->buflen;
+    int nwp = r->wp + 1;
+
+    if ( nwp == r->options->buflen )
+    {
+        nwp = 0;
+    }
 
     if ( nwp == r->rp )
     {
@@ -773,7 +782,10 @@ static bool _rxAdd( struct RunTime *r, uint8_t c )
         }
         else
         {
-            r->rp = ( r->rp + 1 ) % r->options->buflen;
+            if ( ++r->rp == r->options->buflen )
+            {
+                r->rp = 0;
+            }
         }
     }
 
@@ -796,20 +808,31 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     {
         if ( p->tag == r->options->tag )
         {
+            if ( r->options->holdAt )
+            {
+                if ( r->holdTriggered )
+                {
+                    if ( r->holdTail <= 0 )
+                    {
+                        /* Hold point reached and its tail captured: keep the buffer as it is */
+                        return;
+                    }
+
+                    r->holdTail -= p->len;
+                }
+                else
+                {
+                    /* Follow the program flow through this packet (may trigger the hold) */
+                    TRACEDecoderPump( &r->ti, p->d, p->len, _holdCB, r );
+                }
+            }
+
             for ( int i = 0; i < p->len; i++ )
             {
-                if ( ( r->options->holdAt ) && ( r->holdTriggered ) && ( r->holdTail <= 0 ) )
-                {
-                    /* Hold point reached and its tail captured: keep the buffer as it is */
-                    return;
-                }
-
                 if ( _rxAdd( r, p->d[i] ) )
                 {
                     return;
                 }
-
-                _holdFeed( r, p->d[i] );
             }
         }
     }
@@ -1640,6 +1663,13 @@ int main( int argc, char *argv[] )
 
     /* Put a record of the protocol in use on screen */
     SIOtagText( _r.sio, TRACEDecodeGetProtocolName( _r.options->traceProt ) );
+
+    if ( _r.options->holdAt )
+    {
+        static char armMsg[128];
+        snprintf( armMsg, sizeof( armMsg ), "Will hold at %s (0x%08x-0x%08x)", _r.holdName, ( uint32_t )_r.holdLow, ( uint32_t )_r.holdHigh );
+        SIOalert( _r.sio, armMsg );
+    }
 
     while ( !_r.ending )
     {
