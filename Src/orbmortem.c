@@ -40,6 +40,8 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define MAX_TAGS            (10)        /* How many tags we will allow */
 
 /* Hold-at-function (-x): live flow tracking */
+#define DIS_CACHE_SIZE      (1 << 16)   /* Disassembly cache for building the display (addr >> 1) */
+#define OPTEXT_MIN_ALLOC    (4096)      /* Display lines array starts at this and doubles */
 #define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
 #define HOLD_TAIL_BYTES     (16)        /* Trace bytes kept after the trigger, so the entry is shown */
                                         /* (ETM uses ~0.1 byte per instruction, so this is ~100+)    */
@@ -122,6 +124,14 @@ struct RunTime
     struct sioline *opText;             /* Text of the output buffer */
     int32_t lineNum;                    /* Current line number in output buffer */
     int32_t numLines;                   /* Number of lines in the output buffer */
+    int32_t opTextAlloc;                /* Number of lines allocated in opText */
+
+    /* Disassembly cache: disassembling with capstone for every traced instruction is slow */
+    uint32_t dcAddr[DIS_CACHE_SIZE];    /* Address, or NO_ADDRESS if empty */
+    char    *dcText[DIS_CACHE_SIZE];    /* Disassembly text (owned by the cache), NULL if none */
+    uint32_t dcNew[DIS_CACHE_SIZE];     /* Branch destination */
+    uint8_t  dcIc[DIS_CACHE_SIZE];      /* Instruction class */
+    struct symbol *dcSyms;              /* Symbols the cache was filled from */
 
     int32_t diveline;                   /* Line number we're currently diving into */
     char *divefile;                     /* Filename we're currently diving into */
@@ -872,6 +882,7 @@ static void _flushBuffer( struct RunTime *r )
     /* and the opText buffer */
     free( r->opText );
     r->opText = NULL;
+    r->opTextAlloc = 0;
     r->numLines = 0;
 
     /* ...and the file/line references */
@@ -879,6 +890,69 @@ static void _flushBuffer( struct RunTime *r )
     r->op.currentFileindex = NO_FILE;
     r->op.currentFunctionptr = NULL;
     r->op.workingAddr = NO_DESTADDRESS;
+}
+// ====================================================================================================
+static void _opTextGrow( struct RunTime *r )
+
+/* Make room for one more display line. The array doubles when full (growing it one line at */
+/* a time copied the whole array for every line, which is very slow for long histories).    */
+
+{
+    if ( r->numLines >= r->opTextAlloc )
+    {
+        int32_t n = r->opTextAlloc ? r->opTextAlloc * 2 : OPTEXT_MIN_ALLOC;
+        struct sioline *t = ( struct sioline * )realloc( r->opText, sizeof( struct sioline ) * n );
+
+        if ( !t )
+        {
+            genericsExit( -1, "Out of memory for display lines, use a smaller -b" EOL );
+        }
+
+        r->opText = t;
+        r->opTextAlloc = n;
+    }
+}
+// ====================================================================================================
+static const char *_disassemble( struct RunTime *r, enum instructionClass *ic, uint32_t addr, symbolMemaddr *newaddr )
+
+/* symbolDisassembleLine with a cache. The returned text belongs to the cache. */
+
+{
+    if ( r->dcSyms != r->s )
+    {
+        /* New symbol set: empty the cache */
+        for ( int i = 0; i < DIS_CACHE_SIZE; i++ )
+        {
+            free( r->dcText[i] );
+            r->dcText[i] = NULL;
+            r->dcAddr[i] = NO_ADDRESS;
+        }
+
+        r->dcSyms = r->s;
+    }
+
+    uint32_t ci = ( addr >> 1 ) & ( DIS_CACHE_SIZE - 1 );
+
+    if ( r->dcAddr[ci] != addr )
+    {
+        enum instructionClass c = LE_IC_NONE;
+        symbolMemaddr n = NO_ADDRESS;
+        char *a = symbolDisassembleLine( r->s, &c, addr, &n );
+        free( r->dcText[ci] );
+        r->dcText[ci] = a ? strdup( a ) : NULL;
+        r->dcIc[ci]   = ( uint8_t )c;
+        r->dcNew[ci]  = ( uint32_t )n;
+        r->dcAddr[ci] = addr;
+    }
+
+    *ic = ( enum instructionClass )r->dcIc[ci];
+
+    if ( newaddr )
+    {
+        *newaddr = r->dcNew[ci];
+    }
+
+    return r->dcText[ci];
 }
 // ====================================================================================================
 // Strdup leak is deliberately ignored. That is the central purpose of this code. It's cleaned
@@ -906,7 +980,7 @@ static void _appendToOPBuffer( struct RunTime *r, void *dat, int32_t lineno, enu
 
     *p = 0;
 
-    r->opText = ( struct sioline * )realloc( r->opText, ( sizeof( struct sioline ) ) * ( r->numLines + 1 ) );
+    _opTextGrow( r );
     r->opText[r->numLines].buffer = strdup( construct );
     r->opText[r->numLines].lt     = lt;
     r->opText[r->numLines].line   = lineno;
@@ -922,7 +996,7 @@ static void _appendRefToOPBuffer( struct RunTime *r, void *dat, int32_t lineno, 
 /* Add line to output buffer, as a reference (which don't be free'd later) */
 
 {
-    r->opText = ( struct sioline * )realloc( r->opText, ( sizeof( struct sioline ) ) * ( r->numLines + 1 ) );
+    _opTextGrow( r );
 
     /* This line removes the 'const', but we know to not mess with this line */
     r->opText[r->numLines].buffer = ( char * )ref;
@@ -1229,7 +1303,7 @@ static void _traceCB( void *d )
         }
 
         /* Now output the matching assembly, and location updates */
-        char *a = symbolDisassembleLine( r->s, &ic, r->op.workingAddr, &newaddr );
+        const char *a = _disassemble( r, &ic, r->op.workingAddr, &newaddr );
 
         if ( a )
         {
@@ -1249,7 +1323,8 @@ static void _traceCB( void *d )
                                              ( ( ( r->op.workingAddr != targetAddr ) && ( ! ( ic & LE_IC_JUMP ) ) )  ||
                                                ( r->op.workingAddr == targetAddr )
                                              ) ) );
-            _appendToOPBuffer( r, l, r->op.currentLine, insExecuted ? LT_ASSEMBLY : LT_NASSEMBLY, a );
+            /* The text lives in the disassembly cache, so it can be referenced instead of copied */
+            _appendRefToOPBuffer( r, l, r->op.currentLine, insExecuted ? LT_ASSEMBLY : LT_NASSEMBLY, a );
 
 
             /* Move addressing along */
