@@ -292,6 +292,32 @@ static void _getSourceLines( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die die )
             dwarf_lineaddr( linebuf[i], &line_addr, 0 );
             dwarf_linebeginstatement( linebuf[i], &begin, 0 );
 
+            Dwarf_Bool endseq = false;
+            dwarf_lineendsequence( linebuf[i], &endseq, 0 );
+
+            if ( endseq )
+            {
+                /* End of a sequence (e.g. the end of a function's section): not a line of its own, */
+                /* but it ends the line before it, rather than running on to the next code.       */
+                if ( ( !zero_start_dont_store ) && ( p->nlines ) && ( line_addr > p->line[p->nlines - 1]->lowaddr ) )
+                {
+                    p->line[p->nlines - 1]->highaddr = line_addr - 1;
+                }
+
+                zero_start_dont_store = false;
+                tracked_addr = line_addr;
+                continue;
+            }
+
+            dwarf_lineno( linebuf[i], &line_num, 0 );
+
+            if ( ( !line_num ) && ( !( ( isset ) && ( line_addr == 0 ) ) ) )
+            {
+                /* Line 0: compiler-generated code with no source line; it belongs to the line before */
+                tracked_addr = line_addr;
+                continue;
+            }
+
             if ( ( isset ) && ( line_addr == 0 ) )
             {
                 zero_start_dont_store = true;
@@ -615,61 +641,70 @@ static bool _readLines( struct symbol *p )
         qsort( p->line, p->nlines, sizeof( struct symbolLineStore * ), _compareLineMem );
         qsort( p->func, p->nfunc, sizeof( struct symbolFunctionStore * ), _compareFunc );
 
-        /* Combine addresses in the lines table which have the same memory location...those aren't too useful for us      */
+        /* Combine entries in the lines table which have the same memory location...those aren't too useful for us */
+        /* (The previous loops advanced the index twice after each group, which dropped the entry following it,  */
+        /* and never looked at the last entry.)                                                                  */
         int nlines = 0;
-        struct symbolLineStore **nls = NULL;
+        struct symbolLineStore **nls = ( struct symbolLineStore ** )malloc( sizeof( struct symbolLineStore * ) * p->nlines );
 
-        for ( int i = 0; i < p->nlines - 1; i++ )
+        if ( !nls )
         {
-            nls = ( struct symbolLineStore ** )realloc( nls, sizeof( struct symbolLineStore * ) * ( nlines + 1 ) );
+            genericsExit( -1, "Memory allocation failure" EOL );
+        }
 
-            if ( !nls )
+        for ( int i = 0; i < p->nlines; )
+        {
+            struct symbolLineStore *keep = p->line[i++];
+
+            while ( ( i < p->nlines ) &&
+                    ( keep->filename == p->line[i]->filename ) &&
+                    ( keep->lowaddr == p->line[i]->lowaddr ) )
             {
-                genericsExit( -1, "Memory allocation failure" EOL );
-            }
+                if ( p->line[i]->highaddr > keep->highaddr )
+                {
+                    keep->highaddr = p->line[i]->highaddr;
+                }
 
-            nls[nlines] = p->line[i];
-
-            /* Roll forward through all lines which have the same start address */
-            while ( ( ++i < p->nlines - 1 ) &&
-                    ( ( nls[nlines]->filename == p->line[i]->filename ) ) &&
-                    ( ( nls[nlines]->lowaddr == p->line[i]->lowaddr ) ) )
-            {
                 /* This line needs to be freed in memory 'cos otherwise there is no reference to it anywhere */
-                free( p->line[i] );
+                free( p->line[i++] );
             }
 
-            nlines++;
+            nls[nlines++] = keep;
         }
 
         free( p->line );
         p->line = nls;
         p->nlines = nlines;
 
+        /* Now do the same for consecutive entries with the same line number and file, and set the high */
+        /* memory extent of each line: up to the next line, unless the end of its sequence was given.   */
         nlines = 0;
-        nls = NULL;
 
-        /* Now do the same for lines with the same line number and file */
-        /* We can also set the high memory extent for each line here */
-        for ( int i = 0; i < p->nlines - 1; i++ )
+        for ( int i = 0; i < p->nlines; )
         {
-            nls = ( struct symbolLineStore ** )realloc( nls, sizeof( struct symbolLineStore * ) * ( nlines + 1 ) );
-            nls[nlines] = p->line[i];
+            struct symbolLineStore *keep = p->line[i++];
 
-            while ( ( ++i < p->nlines - 1 ) &&
-                    ( nls[nlines]->startline == p->line[i]->startline ) &&
-                    ( nls[nlines]->filename == p->line[i]->filename ) )
+            while ( ( i < p->nlines ) &&
+                    ( keep->startline == p->line[i]->startline ) &&
+                    ( keep->filename == p->line[i]->filename ) &&
+                    ( !keep->highaddr ) )
             {
-                free( p->line[i] );
+                keep->highaddr = p->line[i]->highaddr;
+                free( p->line[i++] );
             }
 
-            nls[nlines]->highaddr = p->line[i]->lowaddr - 1;
-            nlines++;
+            p->line[nlines++] = keep;
         }
 
-        free( p->line );
-        p->line = nls;
         p->nlines = nlines;
+
+        for ( int i = 0; i < p->nlines; i++ )
+        {
+            if ( !p->line[i]->highaddr )
+            {
+                p->line[i]->highaddr = ( i < p->nlines - 1 ) ? p->line[i + 1]->lowaddr - 1 : p->line[i]->lowaddr + 2;
+            }
+        }
 
         if ( !p->nlines )
         {
@@ -677,8 +712,6 @@ static bool _readLines( struct symbol *p )
         }
         else
         {
-            p->line[p->nlines - 1]->highaddr = p->line[p->nlines - 1]->lowaddr + 2;
-            p->line[0]->lowaddr = p->line[0]->highaddr - 2;
 
             /* Allocate lines to functions ... these will be in address order 'cos the lines already are */
             for ( int i = 0; i < p->nlines; i++ )
