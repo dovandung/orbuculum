@@ -712,15 +712,34 @@ static bool _loadSource( struct symbol *p )
         /* Create an entry for this file. It will remain zero (NULL) if there are no lines in it, because r was NULL */
         struct symbolSourcecodeStore *store = p->source[i] = ( struct symbolSourcecodeStore * )calloc( 1, sizeof( struct symbolSourcecodeStore ) );
 
-        /* Lines in sio.c are demarked by \n, \r or \0 ... so we just need to find the indicies to one after each of those */
+        /* Split into lines: each '\n' (and a '\r' before it) is replaced by a terminating 0.      */
+        /* (The previous version zeroed the character *after* each '\n' instead, which ate the   */
+        /* first character of every line and dropped blank lines, so line numbers drifted.)    */
+        unsigned int alloc = 0;
+
         while ( l )
         {
             /* Add this line to the storage. */
-            store->linetext = ( char ** )realloc( store->linetext, sizeof( char * ) * ( store->nlines + 1 ) );
+            if ( store->nlines >= alloc )
+            {
+                alloc = alloc ? alloc * 2 : 256;
+                store->linetext = ( char ** )realloc( store->linetext, sizeof( char * ) * alloc );
+            }
+
+            char *start = r;
             store->linetext[store->nlines++] = r;
 
-            /* Spin forwards for next newline or eof */
-            while ( ( --l > 0 ) && ( *r++ != '\n' ) ) {};
+            /* Spin forwards to the next newline or the end */
+            while ( ( l ) && ( *r != '\n' ) )
+            {
+                r++;
+                l--;
+            }
+
+            if ( ( r > start ) && ( *( r - 1 ) == '\r' ) )
+            {
+                *( r - 1 ) = 0;
+            }
 
             if ( l )
             {
