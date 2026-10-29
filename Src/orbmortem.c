@@ -41,7 +41,8 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 
 /* Hold-at-function (-x): live flow tracking */
 #define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
-#define HOLD_TAIL_BYTES     (256)       /* Trace bytes kept after the trigger, so the entry is shown */
+#define HOLD_TAIL_BYTES     (16)        /* Trace bytes kept after the trigger, so the entry is shown */
+                                        /* (ETM uses ~0.1 byte per instruction, so this is ~100+)    */
 
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
