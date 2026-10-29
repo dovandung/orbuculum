@@ -47,7 +47,10 @@ jobs:
         working-directory: ./libusb/build
 
       # Newer GCC warns about code in the bundled libdwarf, which is built with -Werror.
-      - run: "export PKG_CONFIG_PATH=`realpath ../libusb/install/lib/pkgconfig` && meson setup ./build --prefix A:/ -Dwerror=false -Dlibdwarf:werror=false"
+      # Optimised x64 build: -O3 (meson's default is an unoptimised debug build), for any x86-64 CPU
+      # with SSE4.2/POPCNT (x86-64-v2, about 2009 onwards). Debug info is kept for the debug kit and
+      # stripped from the normal download.
+      - run: "export PKG_CONFIG_PATH=`realpath ../libusb/install/lib/pkgconfig` && meson setup ./build --prefix A:/ -Dwerror=false -Dlibdwarf:werror=false --buildtype=debugoptimized -Doptimization=3 -Dc_args='-march=x86-64-v2 -mtune=generic'"
         working-directory: ./orbuculum
       - run: ninja -C ./build
         working-directory: ./orbuculum
