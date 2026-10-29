@@ -43,8 +43,8 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DIS_CACHE_SIZE      (1 << 16)   /* Disassembly cache for building the display (addr >> 1) */
 #define OPTEXT_MIN_ALLOC    (4096)      /* Display lines array starts at this and doubles */
 #define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
-#define HOLD_TAIL_BYTES     (16)        /* Trace bytes kept after the trigger, so the entry is shown */
-                                        /* (ETM uses ~0.1 byte per instruction, so this is ~100+)    */
+#define HOLD_TAIL_BYTES     (4)         /* Trace bytes kept after the trigger, so the entry is shown */
+                                        /* (one ETM atom byte covers up to ~16 instructions)         */
 
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
@@ -832,22 +832,34 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
         {
             if ( r->options->holdAt )
             {
-                if ( r->holdTriggered )
+                /* Byte by byte, so the history stops exactly HOLD_TAIL_BYTES after the trigger point */
+                /* (a packet can hold thousands of bytes, i.e. many thousands of instructions).     */
+                for ( int i = 0; i < p->len; i++ )
                 {
-                    if ( r->holdTail <= 0 )
+                    if ( r->holdTriggered )
                     {
-                        /* Hold point reached and its tail captured: keep the buffer as it is */
-                        return;
+                        if ( r->holdTail <= 0 )
+                        {
+                            /* Hold point reached and its tail captured: keep the buffer as it is */
+                            return;
+                        }
+
+                        r->holdTail--;
+                    }
+                    else
+                    {
+                        /* Follow the program flow (may trigger the hold) */
+                        r->hsBytes++;
+                        TRACEDecoderPump( &r->ti, &p->d[i], 1, _holdCB, r );
                     }
 
-                    r->holdTail -= p->len;
+                    if ( _rxAdd( r, p->d[i] ) )
+                    {
+                        return;
+                    }
                 }
-                else
-                {
-                    /* Follow the program flow through this packet (may trigger the hold) */
-                    r->hsBytes += p->len;
-                    TRACEDecoderPump( &r->ti, p->d, p->len, _holdCB, r );
-                }
+
+                return;
             }
 
             for ( int i = 0; i < p->len; i++ )
