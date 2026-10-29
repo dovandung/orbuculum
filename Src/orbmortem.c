@@ -1477,28 +1477,44 @@ static bool _dumpBuffer( struct RunTime *r )
 // ====================================================================================================
 static struct symbolLineStore *_fileAndLine( struct RunTime *r, uint32_t i )
 
-{
-    /* Search backwards from current position in buffer until we find a line a line record attached */
-    /* (b) a filename which contains this line. */
+/* Find the source line record for buffer line i: the nearest source or assembly line with a  */
+/* line record at or above i, but not past a function header (that would be another function, */
+/* e.g. the code an interrupt broke into). Failing that, look below i.                        */
 
-    while ( ( i ) &&
-            ( ( ( ( r->opText[i].lt != LT_SOURCE ) && ( r->opText[i].lt != LT_ASSEMBLY ) ) || r->opText[i].dat == NULL ) ) )
+{
+    #define _HASREF(n) ( ( ( r->opText[n].lt == LT_SOURCE ) || ( r->opText[n].lt == LT_ASSEMBLY ) || \
+                           ( r->opText[n].lt == LT_NASSEMBLY ) ) && ( r->opText[n].dat != NULL ) )
+
+    if ( ( !r->numLines ) || ( i >= ( uint32_t )r->numLines ) )
     {
-        i--;
+        return NULL;
     }
 
-    if ( !i || !r->opText[i].dat )
+    /* Upwards, stopping at the header of the function we're in */
+    for ( int32_t n = i; n >= 0; n-- )
     {
-        i = SIOgetCurrentLineno( r->sio );
-
-        while ( ( i ) &&
-                ( ( ( ( r->opText[i].lt != LT_SOURCE ) && ( r->opText[i].lt != LT_ASSEMBLY ) ) || r->opText[i].dat == NULL ) ) )
+        if ( _HASREF( n ) )
         {
-            i++;
+            return ( struct symbolLineStore * )r->opText[n].dat;
+        }
+
+        if ( r->opText[n].lt == LT_FILE )
+        {
+            break;
         }
     }
 
-    return ( struct symbolLineStore * )( ( i < r->numLines ) ? r->opText[i].dat : NULL );
+    /* Downwards (e.g. the cursor is on a function header) */
+    for ( int32_t n = i; n < r->numLines; n++ )
+    {
+        if ( _HASREF( n ) )
+        {
+            return ( struct symbolLineStore * )r->opText[n].dat;
+        }
+    }
+
+    return NULL;
+    #undef _HASREF
 }
 // ====================================================================================================
 static void _mapFileBuffer( struct RunTime *r, int lineno, int filenameIndex )
@@ -1971,13 +1987,15 @@ int main( int argc, char *argv[] )
                         }
                         while ( l && ( l < _r.numLines - 1 ) && ( ( _r.opText[l].lt != LT_SOURCE ) ) );
 
-                        if ( l )
+                        struct symbolLineStore *newLine = l ? _fileAndLine( &_r, l ) : NULL;
+
+                        if ( ( newLine ) && ( oldLine ) )
                         {
-                            if ( oldLine->filename == _fileAndLine( &_r, l )->filename )
+                            if ( oldLine->filename == newLine->filename )
                             {
                                 /* We are still in the same file, so only the line number to change */
                                 _r.lineNum = l;
-                                SIOsetCurrentLineno( _r.sio, _fileAndLine( &_r, l )->startline - 1 );
+                                SIOsetCurrentLineno( _r.sio, newLine->startline - 1 );
                                 SIOrequestRefresh( _r.sio );
                             }
                             else
