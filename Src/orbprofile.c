@@ -35,7 +35,12 @@ enum Prot { PROT_OFLOW, PROT_ETM, PROT_UNKNOWN };
 const char *protString[] = {"OFLOW", "ETM", NULL};
 
 /* How many transfer buffers from the source to allocate */
-#define NUM_RAW_BLOCKS (1000)
+#define DEFAULT_BUFFER_MB (256)          /* Default capture buffer size, can be changed with -b */
+#define MIN_RAW_BLOCKS (4)
+
+/* Direct-mapped cache in front of the instruction hash table (decoding looks up every instruction) */
+#define ICACHE_BITS (16)
+#define ICACHE_SIZE (1 << ICACHE_BITS)
 
 #ifdef ORBPROFILE_DEBUG
 #define DBG_OUT(...) fprintf(stderr,__VA_ARGS__)
@@ -69,6 +74,7 @@ struct Options                           /* Record for options, either defaults 
     char *dotfile;                       /* File to output dot information */
     char *profile;                       /* File to output profile information */
     int  sampleDuration;                 /* How long we are going to sample for */
+    int  bufferMB;                       /* Capture buffer size in MiB */
     bool mono;                           /* Supress colour in output */
     bool noaltAddr;                      /* Dont use alternate addressing */
     int  tag;                            /*  Which OFLOW stream are we decoding? */
@@ -83,6 +89,7 @@ struct Options                           /* Record for options, either defaults 
 {
     .demangle       = true,
     .sampleDuration = DEFAULT_DURATION_MS,
+    .bufferMB       = DEFAULT_BUFFER_MB,
     .port           = OFCLIENT_SERVER_PORT,
     .tProtocol      = TRACE_PROT_ETM35,
     .tag            = 2,
@@ -149,7 +156,12 @@ struct RunTime
     /* Ring buffer for samples ... this 'pads' the rate data arrive and how fast they can be processed */
     int wp;                                     /* Read and write pointers into transfer buffers */
     int rp;
-    struct dataBlock rawBlock[NUM_RAW_BLOCKS];  /* Transfer buffers from the receiver */
+    struct dataBlock *rawBlock;                 /* Transfer buffers from the receiver (allocated, -b) */
+    int numBlocks;                              /* Number of transfer buffers */
+
+    /* Instruction lookup cache: addresses and records, indexed by (addr >> 1) */
+    uint32_t icacheAddr[ICACHE_SIZE];
+    struct execEntryHash *icacheEntry[ICACHE_SIZE];
 
     /* State info */
     volatile bool ending;                       /* Flag indicating app is terminating */
@@ -276,10 +288,21 @@ static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
 {
     struct nameEntry n;
 
+    /* Fast path: direct-mapped cache (Thumb instructions are at even addresses) */
+    uint32_t ci = ( addr >> 1 ) & ( ICACHE_SIZE - 1 );
+
+    if ( ( r->icacheAddr[ci] == addr ) && ( r->icacheEntry[ci] ) )
+    {
+        *h = r->icacheEntry[ci];
+        return true;
+    }
+
     HASH_FIND_INT( r->insthead, &addr, *h );
 
     if ( *h )
     {
+        r->icacheAddr[ci]  = addr;
+        r->icacheEntry[ci] = *h;
         return true;
     }
 
@@ -317,6 +340,8 @@ static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
     ( *h )->assyText      = n.assy[n.assyLine].lineText;
 
     HASH_ADD_INT( r->insthead, addr, ( *h ) );
+    r->icacheAddr[ci]  = addr;
+    r->icacheEntry[ci] = *h;
     return true;
 }
 // ====================================================================================================
@@ -545,6 +570,8 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -E, --eof:          When reading from file, terminate at EOF" EOL );
     genericsFPrintf( stderr, "    -f, --input-file:   Take input from specified file" EOL );
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
+    genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Capture buffer size (default %d). Decoding is slower than a fast" EOL, DEFAULT_BUFFER_MB );
+    genericsFPrintf( stderr, "                        CPU makes ETM data, so this sets how long a capture can be" EOL );
     genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time between samples (in ms)" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
@@ -576,6 +603,7 @@ static struct option _longOptions[] =
     {"input-file", required_argument, NULL, 'f'},
     {"help", no_argument, NULL, 'h'},
     {"interval", required_argument, NULL, 'I'},
+    {"buffer-size", required_argument, NULL, 'b'},
     {"no-colour", no_argument, NULL, 'M'},
     {"no-color", no_argument, NULL, 'M'},
     {"objdump-opts", required_argument, NULL, 'O'},
@@ -598,7 +626,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "ADd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:Dd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
@@ -649,6 +677,17 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 return false;
 
             // ------------------------------------
+            case 'b':
+                r->options->bufferMB = atoi( optarg );
+
+                if ( r->options->bufferMB <= 0 )
+                {
+                    genericsReport( V_ERROR, "-b requires a positive size in MiB" EOL );
+                    return false;
+                }
+
+                break;
+
             case 'I':
                 r->options->sampleDuration = atoi( optarg );
                 break;
@@ -802,6 +841,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     genericsReport( V_INFO, "Orbflow Tag     : %d" EOL, r->options->tag );
     genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
     genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
+    genericsReport( V_INFO, "Capture buffer  : %d MiB" EOL, r->options->bufferMB );
 
     switch ( r->options->protocol )
     {
@@ -866,9 +906,9 @@ static bool _queueBlock( struct RunTime *r, bool force )
 
 {
     pthread_mutex_lock( &r->dataForClients_m );
-    int nwp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
+    int nwp = ( r->wp + 1 ) % r->numBlocks;
 
-    if ( ( ( nwp + 1 ) % NUM_RAW_BLOCKS == r->rp ) && ( !force ) )
+    if ( ( ( nwp + 1 ) % r->numBlocks == r->rp ) && ( !force ) )
     {
         pthread_mutex_unlock( &r->dataForClients_m );
         return false;
@@ -921,7 +961,7 @@ static void *_processBlocks( void *params )
         }
 
         pthread_mutex_lock( &r->dataForClients_m );
-        r->rp = ( r->rp + 1 ) % NUM_RAW_BLOCKS;
+        r->rp = ( r->rp + 1 ) % r->numBlocks;
         pthread_mutex_unlock( &r->dataForClients_m );
     }
 
@@ -977,6 +1017,23 @@ int main( int argc, char *argv[] )
     }
 
 #endif
+
+    /* Capture buffer: whole blocks of TRANSFER_SIZE, at least MIN_RAW_BLOCKS of them */
+    _r.numBlocks = ( int )( ( ( uint64_t )_r.options->bufferMB * 1024 * 1024 ) / TRANSFER_SIZE );
+
+    if ( _r.numBlocks < MIN_RAW_BLOCKS )
+    {
+        _r.numBlocks = MIN_RAW_BLOCKS;
+    }
+
+    _r.rawBlock = ( struct dataBlock * )malloc( ( size_t )_r.numBlocks * sizeof( struct dataBlock ) );
+
+    if ( !_r.rawBlock )
+    {
+        genericsExit( -1, "Can't allocate a %d MiB capture buffer, use a smaller -b" EOL, _r.options->bufferMB );
+    }
+
+    _r.rawBlock[0].fillLevel = 0;
 
     TRACEDecoderInit( &_r.i, _r.options->tProtocol, !_r.options->noaltAddr, genericsReport );
     OFLOWInit( &_r.c );
@@ -1053,7 +1110,7 @@ int main( int argc, char *argv[] )
 
 
             /* Data are gathered into large blocks: the decoder is usually slower than the trace */
-            /* (every instruction is decoded), so the buffer (NUM_RAW_BLOCKS x TRANSFER_SIZE)     */
+            /* (every instruction is decoded), so the buffer (-b, numBlocks x TRANSFER_SIZE)      */
             /* holds the capture while decoding catches up.                                     */
             struct dataBlock *rxBlock = &_r.rawBlock[_r.wp];
             size_t got = 0;
