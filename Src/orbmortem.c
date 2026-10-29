@@ -7,6 +7,7 @@
  */
 
 #include <stdarg.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/types.h>
@@ -157,6 +158,11 @@ struct RunTime
     uint32_t hcNew[HOLD_ICACHE_SIZE];   /* ...branch destination */
     uint8_t  hcIc[HOLD_ICACHE_SIZE];    /* ...instruction class */
     bool     hcFound[HOLD_ICACHE_SIZE]; /* ...false if there is no instruction at that address */
+    uint64_t hsBytes;                   /* Live tracker statistics, shown while armed */
+    uint64_t hsCallbacks;
+    uint64_t hsAddrs;
+    uint64_t hsInstr;
+    uint64_t hsLost;
 } _r;
 
 /* For opening the editor (Shift-Right-Arrow) the following command lines work for a few editors;
@@ -612,6 +618,8 @@ static void _holdCB( void *d )
         return;
     }
 
+    r->hsCallbacks++;
+
     if ( r->s != r->holdSyms )
     {
         /* Symbols were reloaded (the ELF changed) */
@@ -624,6 +632,7 @@ static void _holdCB( void *d )
     if ( TRACEStateChanged( &r->ti, EV_CH_ADDRESS ) )
     {
         r->holdAddr = cpu->addr & ~1UL;
+        r->hsAddrs++;
 
         if ( _holdHit( r, r->holdAddr ) )
         {
@@ -643,9 +652,11 @@ static void _holdCB( void *d )
         {
             /* Not in the image: position unknown until the next address */
             r->holdAddr = NO_ADDRESS;
+            r->hsLost++;
             break;
         }
 
+        r->hsInstr++;
         bool executed = ( disposition & 1 );
         uint32_t len = ( ic & LE_IC_4BYTE ) ? 4 : 2;
         disposition >>= 1;
@@ -823,6 +834,7 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
                 else
                 {
                     /* Follow the program flow through this packet (may trigger the hold) */
+                    r->hsBytes += p->len;
                     TRACEDecoderPump( &r->ti, p->d, p->len, _holdCB, r );
                 }
             }
@@ -1944,6 +1956,16 @@ int main( int argc, char *argv[] )
             {
                 _r.oldTotalIntervalBytes = _r.newTotalBytes - _r.oldTotalBytes;
                 _r.oldTotalBytes = _r.newTotalBytes;
+
+                if ( ( _r.options->holdAt ) && ( !_r.held ) )
+                {
+                    /* Show what the live tracker is doing while waiting for the hold function */
+                    static char hsMsg[200];
+                    snprintf( hsMsg, sizeof( hsMsg ), "%s: %" PRIu64 "KB %s cb %" PRIu64 " addr %" PRIu64 " ins %" PRIu64 "K lost %" PRIu64 " at %08x",
+                              _r.holdName, _r.hsBytes / 1024, TRACEDecoderIsSynced( &_r.ti ) ? "sync" : "NOSYNC",
+                              _r.hsCallbacks, _r.hsAddrs, _r.hsInstr / 1000, _r.hsLost, _r.holdAddr );
+                    SIOalert( _r.sio, hsMsg );
+                }
                 lastTSTime = genericsTimestampmS();
             }
         }
