@@ -458,6 +458,16 @@ static void _processDie( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die die, int l
 
     Dwarf_Die sib = die;
 
+    /* The loop below only visits the siblings *after* this DIE, so deal with this one first */
+    /* (otherwise the first function of every compile unit was missing from the table).    */
+    if ( DW_DLV_OK == dwarf_tag( die, &tag, 0 ) )
+    {
+        if ( ( tag == DW_TAG_subprogram ) || ( tag == DW_TAG_inlined_subroutine ) )
+        {
+            _processFunctionDie( p, dbg, die, filenameN, producerN, cu_base_addr );
+        }
+    }
+
     while ( DW_DLV_OK == dwarf_siblingof_b( dbg, sib, IS_INFO, &sib, 0 ) )
     {
         dwarf_tag( sib, &tag, 0 );
