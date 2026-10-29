@@ -43,6 +43,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DIS_CACHE_SIZE      (1 << 16)   /* Disassembly cache for building the display (addr >> 1) */
 #define OPTEXT_MIN_ALLOC    (4096)      /* Display lines array starts at this and doubles */
 #define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
+#define HOLD_MAX_RANGES     (8)         /* Max functions with the same name that -x watches */
 #define HOLD_TAIL_BYTES     (4)         /* Trace bytes kept after the trigger, so the entry is shown */
                                         /* (one ETM atom byte covers up to ~16 instructions)         */
 
@@ -159,8 +160,9 @@ struct RunTime
     /* Hold-at-function (-x): a second decoder follows the program flow live, while the trace is captured */
     struct TRACEDecoder ti;             /* Live decoder */
     struct symbol *holdSyms;            /* Symbol set the hold range was resolved against */
-    symbolMemaddr holdLow;              /* Address range that triggers the hold (inclusive) */
-    symbolMemaddr holdHigh;
+    int holdNumRanges;                  /* Address ranges that trigger the hold (inclusive). There can */
+    uint32_t holdLowR[HOLD_MAX_RANGES]; /* be several functions of one name, e.g. a weak default      */
+    uint32_t holdHighR[HOLD_MAX_RANGES];/* handler in the startup file and the real one.              */
     const char *holdName;               /* Name of what we hold at, for the screen */
     uint32_t holdAddr;                  /* Live tracked address, or NO_ADDRESS if not known */
     bool holdTriggered;                 /* Range was reached: capture the tail, then hold */
@@ -549,30 +551,37 @@ static bool _holdResolve( struct RunTime *r )
 
     if ( ( a[0] == '0' ) && ( ( a[1] == 'x' ) || ( a[1] == 'X' ) ) )
     {
-        r->holdLow = r->holdHigh = strtoul( a, NULL, 16 ) & ~1UL;
+        r->holdLowR[0] = r->holdHighR[0] = strtoul( a, NULL, 16 ) & ~1UL;
+        r->holdNumRanges = 1;
         r->holdName = a;
         return true;
     }
 
     struct symbolFunctionStore *f;
+    r->holdNumRanges = 0;
 
-    for ( unsigned int i = 0; ( f = symbolFunctionIndex( r->s, i ) ); i++ )
+    /* Exact name first; if nothing matches, ignore upper/lower case (e.g. systick_handler) */
+    for ( int pass = 0; ( pass < 2 ) && ( !r->holdNumRanges ); pass++ )
+    {
+    for ( unsigned int i = 0; ( f = symbolFunctionIndex( r->s, i ) ) && ( r->holdNumRanges < HOLD_MAX_RANGES ); i++ )
     {
         /* Skip declarations (e.g. from a header, in another file's debug info) and inline */
         /* templates: they have no code of their own.                                     */
-        if ( ( f->funcname ) && ( !f->isinline ) && ( !strcmp( f->funcname, a ) ) &&
+        if ( ( f->funcname ) && ( !f->isinline ) && ( pass ? !strcasecmp( f->funcname, a ) : !strcmp( f->funcname, a ) ) &&
                 ( f->lowaddr ) && ( f->highaddr >= f->lowaddr ) &&
                 ( symbolCodeAt( r->s, f->lowaddr & ~1UL, NULL ) ) )
         {
-            r->holdLow  = f->lowaddr & ~1UL;
-            r->holdHigh = f->highaddr;
+            /* Keep all of them: we can't tell which one the linker used */
+            r->holdLowR[r->holdNumRanges]  = f->lowaddr & ~1UL;
+            r->holdHighR[r->holdNumRanges] = f->highaddr;
+            r->holdNumRanges++;
             r->holdName = f->funcname;
-            genericsReport( V_INFO, "Hold at %s (0x%08x..0x%08x)" EOL, a, ( uint32_t )r->holdLow, ( uint32_t )r->holdHigh );
-            return true;
+            genericsReport( V_INFO, "Hold at %s (0x%08x..0x%08x)" EOL, a, ( uint32_t )( f->lowaddr & ~1UL ), ( uint32_t )f->highaddr );
         }
     }
+    }
 
-    return false;
+    return ( r->holdNumRanges > 0 );
 }
 // ====================================================================================================
 static bool _holdLookup( struct RunTime *r, uint32_t addr, enum instructionClass *ic, symbolMemaddr *newaddr )
@@ -600,8 +609,18 @@ static bool _holdLookup( struct RunTime *r, uint32_t addr, enum instructionClass
 static inline bool _holdHit( struct RunTime *r, uint32_t addr )
 
 {
-    if ( ( addr != ( uint32_t )NO_ADDRESS ) && ( addr >= r->holdLow ) && ( addr <= r->holdHigh ) )
+    if ( addr == ( uint32_t )NO_ADDRESS )
     {
+        return false;
+    }
+
+    for ( int n = 0; n < r->holdNumRanges; n++ )
+    {
+        if ( ( addr < r->holdLowR[n] ) || ( addr > r->holdHighR[n] ) )
+        {
+            continue;
+        }
+
         r->holdTriggered = true;
         r->holdTail = HOLD_TAIL_BYTES;
         genericsReport( V_INFO, "Reached %s at 0x%08x" EOL, r->holdName, addr );
@@ -1766,8 +1785,13 @@ int main( int argc, char *argv[] )
 
     if ( _r.options->holdAt )
     {
-        static char armMsg[128];
-        snprintf( armMsg, sizeof( armMsg ), "Will hold at %s (0x%08x-0x%08x)", _r.holdName, ( uint32_t )_r.holdLow, ( uint32_t )_r.holdHigh );
+        static char armMsg[256];
+        int o = snprintf( armMsg, sizeof( armMsg ), "Will hold at %s", _r.holdName );
+
+        for ( int n = 0; ( n < _r.holdNumRanges ) && ( o < ( int )sizeof( armMsg ) - 24 ); n++ )
+        {
+            o += snprintf( &armMsg[o], sizeof( armMsg ) - o, " (0x%08x-0x%08x)", _r.holdLowR[n], _r.holdHighR[n] );
+        }
         SIOalert( _r.sio, armMsg );
     }
 
