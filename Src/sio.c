@@ -227,6 +227,37 @@ static bool _onDisplay( struct SIOInstance *sio, int32_t lineNum )
            );
 }
 // ====================================================================================================
+static void _snapCursor( struct SIOInstance *sio )
+
+/* If the cursor is on a line the current display mode hides (e.g. an assembly line in source */
+/* mode), move it to the nearest shown line above it, or failing that, below it.            */
+
+{
+    if ( ( !sio->opText ) || ( !*sio->opText ) || ( sio->opTextWline <= 0 ) )
+    {
+        return;
+    }
+
+    int32_t l = sio->opTextRline;
+
+    while ( ( l > 0 ) && ( !_onDisplay( sio, l ) ) )
+    {
+        l--;
+    }
+
+    if ( !_onDisplay( sio, l ) )
+    {
+        l = sio->opTextRline;
+
+        while ( ( l < sio->opTextWline - 1 ) && ( !_onDisplay( sio, l ) ) )
+        {
+            l++;
+        }
+    }
+
+    sio->opTextRline = l;
+}
+// ====================================================================================================
 static void _moveCursor( struct SIOInstance *sio, int lines )
 
 /* Move cursor by specified number of lines, in light of current display mode */
@@ -290,6 +321,7 @@ static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
             if ( !sio->amDiving )
             {
                 sio->displayMode = ( sio->displayMode + 1 ) % DISP_MAX_OPTIONS;
+                _snapCursor( sio );
                 op = SIO_EV_CONSUMED;
                 SIOrequestRefresh( sio );
             }
@@ -1031,6 +1063,8 @@ void SIOsetOutputBuffer( struct SIOInstance *sio, int32_t numLines, int32_t curr
         {
             sio->opTextRline = currentLine;
         }
+
+        _snapCursor( sio );
     }
     else
     {
