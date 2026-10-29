@@ -38,6 +38,10 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DEFAULT_PM_BUFLEN_K (32)        /* Default size of the Postmortem buffer */
 #define MAX_TAGS            (10)        /* How many tags we will allow */
 
+/* Hold-at-function (-x): live flow tracking */
+#define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
+#define HOLD_TAIL_BYTES     (256)       /* Trace bytes kept after the trigger, so the entry is shown */
+
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
 #define TICK_TIME_MS        (100)       /* Time intervals for screen updates and keypress check */
@@ -65,6 +69,7 @@ struct Options
     char *openFileCL;                   /* Command line for opening refernced file */
 
     bool withDebugText;                 /* Include debug text (hidden in) output...screws line numbering a bit */
+    char *holdAt;                       /* Function name (or 0x address) to hold at, or NULL */
 } _options =
 {
     .port      = OFCLIENT_SERVER_PORT,
@@ -138,6 +143,20 @@ struct RunTime
     symbolMemaddr callStack[MAX_CALL_STACK]; /* Stack of calls */
     unsigned int stackDepth;            /* Maximum stack depth */
     bool stackDelPending;               /* Possibility to remove an entry from the stack, if address not given */
+
+    /* Hold-at-function (-x): a second decoder follows the program flow live, while the trace is captured */
+    struct TRACEDecoder ti;             /* Live decoder */
+    struct symbol *holdSyms;            /* Symbol set the hold range was resolved against */
+    symbolMemaddr holdLow;              /* Address range that triggers the hold (inclusive) */
+    symbolMemaddr holdHigh;
+    const char *holdName;               /* Name of what we hold at, for the screen */
+    uint32_t holdAddr;                  /* Live tracked address, or NO_ADDRESS if not known */
+    bool holdTriggered;                 /* Range was reached: capture the tail, then hold */
+    int holdTail;                       /* Bytes still to capture after the trigger */
+    uint32_t hcAddr[HOLD_ICACHE_SIZE];  /* Instruction info cache: address (or NO_ADDRESS if empty) */
+    uint32_t hcNew[HOLD_ICACHE_SIZE];   /* ...branch destination */
+    uint8_t  hcIc[HOLD_ICACHE_SIZE];    /* ...instruction class */
+    bool     hcFound[HOLD_ICACHE_SIZE]; /* ...false if there is no instruction at that address */
 } _r;
 
 /* For opening the editor (Shift-Right-Arrow) the following command lines work for a few editors;
@@ -191,6 +210,8 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -s, --server:       <Server>:<Port> to use" EOL );
     genericsFPrintf( stderr, "    -t, --tag:          <stream>: Which OFLOW tag to use (normally 2)" EOL );
     genericsFPrintf( stderr, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsFPrintf( stderr, "    -x, --hold-at:      <function | 0xaddress> Hold as soon as the trace reaches this function" EOL );
+    genericsFPrintf( stderr, "                        (or address). Release with H to wait for the next time." EOL );
     genericsFPrintf( stderr, "    -V, --version:      Print version and exit" EOL );
     genericsFPrintf( stderr, EOL "(Legacy protocol will connect one port higher than that set in -s)" EOL );
     genericsFPrintf( stderr,     "(This will automatically select the second output stream from orbuculum.)" EOL );
@@ -224,6 +245,7 @@ static struct option _longOptions[] =
     {"tag", required_argument, NULL, 't'},
     {"verbose", required_argument, NULL, 'v'},
     {"version", no_argument, NULL, 'V'},
+    {"hold-at", required_argument, NULL, 'x'},
     {NULL, no_argument, NULL, 0}
 };
 // ====================================================================================================
@@ -234,7 +256,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hVMO:p:P:s:t:v:w", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hVMO:p:P:s:t:v:wx:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -388,6 +410,12 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
 
+            case 'x':
+                r->options->holdAt = optarg;
+                break;
+
+            // ------------------------------------
+
             case '?':
                 if ( optopt == 'b' )
                 {
@@ -475,6 +503,198 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     return true;
 }
 // ====================================================================================================
+// Hold-at-function (-x) support
+// ====================================================================================================
+static void _holdReset( struct RunTime *r )
+
+/* (Re)arm: forget where the CPU is and wait for the next sync and address from the trace */
+
+{
+    r->holdAddr = NO_ADDRESS;
+    r->holdTriggered = false;
+    r->holdTail = 0;
+    TRACEDecoderForceSync( &r->ti, false );
+}
+// ====================================================================================================
+static bool _holdResolve( struct RunTime *r )
+
+/* Find the address range for the -x argument in the current symbol set, and empty the cache */
+
+{
+    const char *a = r->options->holdAt;
+
+    for ( int i = 0; i < HOLD_ICACHE_SIZE; i++ )
+    {
+        r->hcAddr[i] = NO_ADDRESS;
+    }
+
+    r->holdSyms = r->s;
+
+    if ( ( a[0] == '0' ) && ( ( a[1] == 'x' ) || ( a[1] == 'X' ) ) )
+    {
+        r->holdLow = r->holdHigh = strtoul( a, NULL, 16 ) & ~1UL;
+        r->holdName = a;
+        return true;
+    }
+
+    struct symbolFunctionStore *f;
+
+    for ( unsigned int i = 0; ( f = symbolFunctionIndex( r->s, i ) ); i++ )
+    {
+        if ( ( f->funcname ) && ( !f->isinline ) && ( !strcmp( f->funcname, a ) ) )
+        {
+            r->holdLow  = f->lowaddr & ~1UL;
+            r->holdHigh = f->highaddr;
+            r->holdName = f->funcname;
+            genericsReport( V_INFO, "Hold at %s (0x%08x..0x%08x)" EOL, a, ( uint32_t )r->holdLow, ( uint32_t )r->holdHigh );
+            return true;
+        }
+    }
+
+    return false;
+}
+// ====================================================================================================
+static bool _holdLookup( struct RunTime *r, uint32_t addr, enum instructionClass *ic, symbolMemaddr *newaddr )
+
+/* Instruction class and branch destination at addr, cached (disassembling is slow). False if no instruction there. */
+
+{
+    uint32_t ci = ( addr >> 1 ) & ( HOLD_ICACHE_SIZE - 1 );
+
+    if ( r->hcAddr[ci] != addr )
+    {
+        enum instructionClass c = LE_IC_NONE;
+        symbolMemaddr n = NO_ADDRESS;
+        r->hcFound[ci] = ( NULL != symbolDisassembleLine( r->s, &c, addr, &n ) );
+        r->hcIc[ci]    = ( uint8_t )c;
+        r->hcNew[ci]   = ( uint32_t )n;
+        r->hcAddr[ci]  = addr;
+    }
+
+    *ic = ( enum instructionClass )r->hcIc[ci];
+    *newaddr = r->hcNew[ci];
+    return r->hcFound[ci];
+}
+// ====================================================================================================
+static inline bool _holdHit( struct RunTime *r, uint32_t addr )
+
+{
+    if ( ( addr != ( uint32_t )NO_ADDRESS ) && ( addr >= r->holdLow ) && ( addr <= r->holdHigh ) )
+    {
+        r->holdTriggered = true;
+        r->holdTail = HOLD_TAIL_BYTES;
+        genericsReport( V_INFO, "Reached %s at 0x%08x" EOL, r->holdName, addr );
+        return true;
+    }
+
+    return false;
+}
+// ====================================================================================================
+static void _holdCB( void *d )
+
+/* Live decode callback: follow the program flow (the same way _traceCB does for ETM3.5, but */
+/* without building any output) and trigger when the hold range is reached.                  */
+
+{
+    struct RunTime *r = ( struct RunTime * )d;
+    struct TRACECPUState *cpu = TRACECPUState( &r->ti );
+    uint32_t incAddr = 0;
+    uint32_t disposition = 0;
+    enum instructionClass ic;
+    symbolMemaddr newaddr;
+
+    if ( ( r->holdTriggered ) || ( !r->s ) )
+    {
+        return;
+    }
+
+    if ( r->s != r->holdSyms )
+    {
+        /* Symbols were reloaded (the ELF changed) */
+        if ( !_holdResolve( r ) )
+        {
+            return;
+        }
+    }
+
+    if ( TRACEStateChanged( &r->ti, EV_CH_ADDRESS ) )
+    {
+        r->holdAddr = cpu->addr & ~1UL;
+
+        if ( _holdHit( r, r->holdAddr ) )
+        {
+            return;
+        }
+    }
+
+    if ( TRACEStateChanged( &r->ti, EV_CH_ENATOMS ) )
+    {
+        incAddr = cpu->eatoms + cpu->natoms;
+        disposition = cpu->disposition;
+    }
+
+    while ( ( incAddr ) && ( r->holdAddr != ( uint32_t )NO_ADDRESS ) )
+    {
+        if ( !_holdLookup( r, r->holdAddr, &ic, &newaddr ) )
+        {
+            /* Not in the image: position unknown until the next address */
+            r->holdAddr = NO_ADDRESS;
+            break;
+        }
+
+        bool executed = ( disposition & 1 );
+        uint32_t len = ( ic & LE_IC_4BYTE ) ? 4 : 2;
+        disposition >>= 1;
+        incAddr--;
+
+        if ( ( ic & LE_IC_CALL ) || ( ic & LE_IC_JUMP ) )
+        {
+            if ( !executed )
+            {
+                r->holdAddr += len;
+            }
+            else if ( ( ic & LE_IC_IMMEDIATE ) || ( ( ic & LE_IC_CALL ) && ( newaddr != NO_ADDRESS ) ) )
+            {
+                r->holdAddr = newaddr;
+            }
+            else
+            {
+                /* Indirect branch: the trace sends the destination address next */
+                r->holdAddr = NO_ADDRESS;
+                break;
+            }
+        }
+        else
+        {
+            r->holdAddr += len;
+        }
+
+        if ( _holdHit( r, r->holdAddr ) )
+        {
+            return;
+        }
+    }
+}
+// ====================================================================================================
+static inline bool _holdFeed( struct RunTime *r, uint8_t c )
+
+/* Pass one received byte to the live decoder. Returns true when capture should stop (hold). */
+
+{
+    if ( !r->options->holdAt )
+    {
+        return false;
+    }
+
+    if ( r->holdTriggered )
+    {
+        return ( --r->holdTail <= 0 );
+    }
+
+    TRACEDecoderPump( &r->ti, &c, 1, _holdCB, r );
+    return false;
+}
+// ====================================================================================================
 static void _processBlock( struct RunTime *r )
 
 /* Generic block processor for received data */
@@ -508,6 +728,12 @@ static void _processBlock( struct RunTime *r )
 
         while ( y-- )
         {
+            if ( ( r->options->holdAt ) && ( r->holdTriggered ) && ( r->holdTail <= 0 ) )
+            {
+                return;
+            }
+
+            _holdFeed( r, *c );
             r->pmBuffer[r->wp] = *c++;
             uint32_t nwp = ( r->wp + 1 ) % r->options->buflen;
 
@@ -572,10 +798,18 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
         {
             for ( int i = 0; i < p->len; i++ )
             {
+                if ( ( r->options->holdAt ) && ( r->holdTriggered ) && ( r->holdTail <= 0 ) )
+                {
+                    /* Hold point reached and its tail captured: keep the buffer as it is */
+                    return;
+                }
+
                 if ( _rxAdd( r, p->d[i] ) )
                 {
                     return;
                 }
+
+                _holdFeed( r, p->d[i] );
             }
         }
     }
@@ -1377,6 +1611,28 @@ int main( int argc, char *argv[] )
 
     TRACEDecoderInit( &_r.i, _r.options->traceProt, !( _r.options->noAltAddr ), _traceReport );
 
+    if ( _r.options->holdAt )
+    {
+        if ( _r.options->traceProt != TRACE_PROT_ETM35 )
+        {
+            genericsExit( -1, "-x (hold at function) is only supported for ETM3.5 trace" EOL );
+        }
+
+        /* The live tracker needs the symbols from the start */
+        if ( !( _r.s = symbolAcquire( _r.options->elffile, true, true ) ) )
+        {
+            genericsExit( -1, "Elf file or symbols in it not found" EOL );
+        }
+
+        if ( !_holdResolve( &_r ) )
+        {
+            genericsExit( -1, "Function %s not found in %s (or use -x 0x<address>)" EOL, _r.options->holdAt, _r.options->elffile );
+        }
+
+        TRACEDecoderInit( &_r.ti, _r.options->traceProt, !( _r.options->noAltAddr ), _traceReport );
+        _holdReset( &_r );
+    }
+
     OFLOWInit( &_r.c );
 
     /* Create a screen and interaction handler */
@@ -1458,6 +1714,28 @@ int main( int argc, char *argv[] )
                 {
                     _processBlock( &_r );
                 }
+
+                /* Hold-at-function reached (and the instructions after it captured): show it */
+                if ( ( _r.options->holdAt ) && ( _r.holdTriggered ) && ( _r.holdTail <= 0 ) )
+                {
+                    if ( _r.numLines )
+                    {
+                        _flushBuffer( &_r );
+                    }
+
+                    if ( !_dumpBuffer( &_r ) )
+                    {
+                        _r.ending = true;
+                    }
+                    else
+                    {
+                        _r.held = true;
+                        SIOheld( _r.sio, _r.held );
+                        static char holdMsg[128];
+                        snprintf( holdMsg, sizeof( holdMsg ), "Reached %s (H to wait for the next time)", _r.holdName );
+                        SIOalert( _r.sio, holdMsg );
+                    }
+                }
             }
 
             /* Update the outputs and deal with any keys that made it up this high */
@@ -1472,6 +1750,12 @@ int main( int argc, char *argv[] )
                         if ( !_r.held )
                         {
                             _r.wp = _r.rp = 0;
+
+                            if ( _r.options->holdAt )
+                            {
+                                /* Re-arm: wait for the next time the function is reached */
+                                _holdReset( &_r );
+                            }
 
                             if ( _r.diving )
                             {
