@@ -104,6 +104,13 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
     }
     fprintf( c, "graph calls\n{\n  overlap=true; splines=true; size=\"7.75,10.25\"; orientation=portrait; sep=0.1; nodesep=1;\n" );
 
+    /* An earlier sort (e.g. by the other writer) may have left the caller's head pointer in */
+    /* the middle of the list, and sorting from there would drop the elements before it.     */
+    while ( subcallList->hh.prev )
+    {
+        subcallList = subcallList->hh.prev;
+    }
+
     HASH_SORT( subcallList, _calls_src_sort_fn );
     s = subcallList;
 
@@ -180,6 +187,12 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     /* positions) aren't executed code, so they are left out here and below.             */
     uint64_t totalInst = 0;
     uint64_t totalVisits = 0;
+
+    /* A sort elsewhere may have left the head pointers we were given mid-list: find the real heads */
+    while ( ( insthead ) && ( insthead->hh.prev ) )
+    {
+        insthead = insthead->hh.prev;
+    }
 
     for ( struct execEntryHash *t = insthead; t; t = t->hh.next )
     {
@@ -289,6 +302,11 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     }
 
     fprintf( c, "\n\n## ------------------- Calls Follow ------------------------\n" );
+    while ( ( subcallList ) && ( subcallList->hh.prev ) )
+    {
+        subcallList = subcallList->hh.prev;
+    }
+
     HASH_SORT( subcallList, _calls_src_sort_fn );
     struct subcall *s = subcallList;
 
