@@ -475,6 +475,186 @@ static void _processFunctionDie( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die di
 }
 
 // ====================================================================================================
+// Inlined copies of functions: every DW_TAG_inlined_subroutine anywhere in the tree, with its
+// address range(s) and the name of the function it is a copy of.
+// ====================================================================================================
+static void _addInline( struct symbol *p, const char *name, Dwarf_Addr low, Dwarf_Addr high )
+
+{
+    if ( ( !name ) || ( !low ) || ( high < low ) )
+    {
+        return;
+    }
+
+    struct symbolInlineStore *n = ( struct symbolInlineStore * )realloc( p->inl, sizeof( struct symbolInlineStore ) * ( p->ninl + 1 ) );
+
+    if ( !n )
+    {
+        return;
+    }
+
+    p->inl = n;
+    p->inl[p->ninl].funcname = strdup( name );
+    p->inl[p->ninl].lowaddr  = low;
+    p->inl[p->ninl].highaddr = high;
+    p->ninl++;
+}
+// ====================================================================================================
+static char *_originName( Dwarf_Debug dbg, Dwarf_Die die )
+
+/* Name of the function an inlined DIE is a copy of: follow abstract_origin / specification */
+
+{
+    char *name = NULL;
+    Dwarf_Die d = die;
+
+    for ( int hops = 0; hops < 4; hops++ )
+    {
+        Dwarf_Attribute a;
+        Dwarf_Off off;
+        Dwarf_Die next;
+
+        if ( ( hops ) && ( DW_DLV_OK == dwarf_diename( d, &name, 0 ) ) )
+        {
+            return name;
+        }
+
+        if ( ( DW_DLV_OK != dwarf_attr( d, DW_AT_abstract_origin, &a, 0 ) ) &&
+                ( DW_DLV_OK != dwarf_attr( d, DW_AT_specification, &a, 0 ) ) )
+        {
+            break;
+        }
+
+        if ( ( DW_DLV_OK != dwarf_global_formref( a, &off, 0 ) ) ||
+                ( DW_DLV_OK != dwarf_offdie_b( dbg, off, IS_INFO, &next, 0 ) ) )
+        {
+            break;
+        }
+
+        d = next;
+    }
+
+    return NULL;
+}
+// ====================================================================================================
+static void _recordInline( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die die, Dwarf_Addr cu_base_addr )
+
+{
+    char *name = _originName( dbg, die );
+    Dwarf_Addr l = 0;
+    Dwarf_Addr h = 0;
+    enum Dwarf_Form_Class formclass = DW_FORM_CLASS_UNKNOWN;
+    Dwarf_Attribute a;
+
+    if ( !name )
+    {
+        return;
+    }
+
+    if ( ( DW_DLV_OK == dwarf_lowpc( die, &l, 0 ) ) && ( DW_DLV_OK == dwarf_highpc_b( die, &h, 0, &formclass, 0 ) ) )
+    {
+        if ( formclass == DW_FORM_CLASS_CONSTANT )
+        {
+            h += l;
+        }
+
+        _addInline( p, name, l, h - 1 );
+        return;
+    }
+
+    /* Split into several ranges (DWARF 4 .debug_ranges) */
+    if ( DW_DLV_OK == dwarf_attr( die, DW_AT_ranges, &a, 0 ) )
+    {
+        Dwarf_Off off = 0;
+        Dwarf_Unsigned u = 0;
+        Dwarf_Off realoff = 0;
+        Dwarf_Ranges *rb = NULL;
+        Dwarf_Signed cnt = 0;
+        Dwarf_Unsigned bytes = 0;
+
+        if ( DW_DLV_OK == dwarf_global_formref( a, &off, 0 ) )
+        {
+        }
+        else if ( DW_DLV_OK == dwarf_formudata( a, &u, 0 ) )
+        {
+            off = u;
+        }
+        else
+        {
+            return;
+        }
+
+        if ( DW_DLV_OK == dwarf_get_ranges_b( dbg, off, die, &realoff, &rb, &cnt, &bytes, 0 ) )
+        {
+            Dwarf_Addr base = cu_base_addr;
+
+            for ( Dwarf_Signed i = 0; i < cnt; i++ )
+            {
+                if ( rb[i].dwr_type == DW_RANGES_ENTRY )
+                {
+                    if ( rb[i].dwr_addr2 > rb[i].dwr_addr1 )
+                    {
+                        _addInline( p, name, base + rb[i].dwr_addr1, base + rb[i].dwr_addr2 - 1 );
+                    }
+                }
+                else if ( rb[i].dwr_type == DW_RANGES_ADDRESS_SELECTION )
+                {
+                    base = rb[i].dwr_addr2;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            dwarf_dealloc_ranges( dbg, rb, cnt );
+        }
+    }
+}
+// ====================================================================================================
+static void _collectInlines( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die die, Dwarf_Addr cu_base_addr, int depth )
+
+/* Walk this DIE, its siblings and all their children */
+
+{
+    Dwarf_Die cur = die;
+    bool first = true;
+
+    while ( true )
+    {
+        Dwarf_Half tag;
+        Dwarf_Die child;
+        Dwarf_Die next;
+
+        if ( ( DW_DLV_OK == dwarf_tag( cur, &tag, 0 ) ) && ( tag == DW_TAG_inlined_subroutine ) )
+        {
+            _recordInline( p, dbg, cur, cu_base_addr );
+        }
+
+        if ( ( depth < 64 ) && ( DW_DLV_OK == dwarf_child( cur, &child, 0 ) ) )
+        {
+            _collectInlines( p, dbg, child, cu_base_addr, depth + 1 );
+            dwarf_dealloc( dbg, child, DW_DLA_DIE );
+        }
+
+        int r = dwarf_siblingof_b( dbg, cur, IS_INFO, &next, 0 );
+
+        if ( !first )
+        {
+            dwarf_dealloc( dbg, cur, DW_DLA_DIE );
+        }
+
+        first = false;
+
+        if ( r != DW_DLV_OK )
+        {
+            break;
+        }
+
+        cur = next;
+    }
+}
+// ====================================================================================================
 
 static void _processDie( struct symbol *p, Dwarf_Debug dbg, Dwarf_Die die, int level, int filenameN, int producerN, Dwarf_Addr cu_base_addr )
 
@@ -626,6 +806,17 @@ static bool _readLines( struct symbol *p )
 
         dwarf_lowpc( cu_die, &cu_low_addr, 0 );
         _processDie( p, dbg, cu_die, 0, filenameN, producerN, cu_low_addr );
+
+        /* ...the places where functions were inlined */
+        {
+            Dwarf_Die child;
+
+            if ( DW_DLV_OK == dwarf_child( cu_die, &child, 0 ) )
+            {
+                _collectInlines( p, dbg, child, cu_low_addr, 0 );
+                dwarf_dealloc( dbg, child, DW_DLA_DIE );
+            }
+        }
 
         /* ...and the source lines */
         _getSourceLines( p, dbg, cu_die );
@@ -834,6 +1025,16 @@ struct symbolFunctionStore *symbolFunctionAt( struct symbol *p, symbolMemaddr ad
 
 // ====================================================================================================
 
+struct symbolInlineStore *symbolInlineIndex( struct symbol *p, unsigned int index )
+
+/* Get indexed inlined copy, or NULL if out of range */
+
+{
+    assert( p );
+    return ( index < p->ninl ) ? &p->inl[index] : NULL;
+}
+
+// ====================================================================================================
 struct symbolFunctionStore *symbolFunctionIndex( struct symbol *p, unsigned int index )
 
 /* Get indexed function, or NULL if out of range */
@@ -981,6 +1182,14 @@ void symbolDelete( struct symbol *p )
 
             free( p->mem );
         }
+
+        while ( p->ninl )
+        {
+            free( p->inl[--p->ninl].funcname );
+        }
+
+        free( p->inl );
+        p->inl = NULL;
 
         while ( p->nfunc )
         {

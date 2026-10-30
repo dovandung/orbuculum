@@ -43,7 +43,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DIS_CACHE_SIZE      (1 << 16)   /* Disassembly cache for building the display (addr >> 1) */
 #define OPTEXT_MIN_ALLOC    (4096)      /* Display lines array starts at this and doubles */
 #define HOLD_ICACHE_SIZE    (1 << 16)   /* Instruction info cache entries (direct mapped on addr >> 1) */
-#define HOLD_MAX_RANGES     (8)         /* Max functions with the same name that -x watches */
+#define HOLD_MAX_RANGES     (32)        /* Max code ranges -x watches (same-name functions, inlined copies) */
 #define HOLD_TAIL_BYTES     (4)         /* Trace bytes kept after the trigger, so the entry is shown */
                                         /* (one ETM atom byte covers up to ~16 instructions)         */
 
@@ -577,6 +577,21 @@ static bool _holdResolve( struct RunTime *r )
             r->holdNumRanges++;
             r->holdName = f->funcname;
             genericsReport( V_INFO, "Hold at %s (0x%08x..0x%08x)" EOL, a, ( uint32_t )( f->lowaddr & ~1UL ), ( uint32_t )f->highaddr );
+        }
+    }
+
+    /* ...and every place the function was inlined into another one */
+    struct symbolInlineStore *in;
+
+    for ( unsigned int i = 0; ( in = symbolInlineIndex( r->s, i ) ) && ( r->holdNumRanges < HOLD_MAX_RANGES ); i++ )
+    {
+        if ( ( in->funcname ) && ( pass ? !strcasecmp( in->funcname, a ) : !strcmp( in->funcname, a ) ) )
+        {
+            r->holdLowR[r->holdNumRanges]  = in->lowaddr & ~1UL;
+            r->holdHighR[r->holdNumRanges] = in->highaddr;
+            r->holdNumRanges++;
+            r->holdName = in->funcname;
+            genericsReport( V_INFO, "Hold at %s, inlined (0x%08x..0x%08x)" EOL, a, ( uint32_t )( in->lowaddr & ~1UL ), ( uint32_t )in->highaddr );
         }
     }
     }

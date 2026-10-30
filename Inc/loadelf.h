@@ -64,6 +64,14 @@ struct symbolSourcecodeStore
 
 enum symbolTables { PT_PRODUCER, PT_FILENAME, PT_NUMTABLES };
 
+/* Structure for one place where a function was inlined into another (one address range) */
+struct symbolInlineStore
+{
+    char                      *funcname;   /* Name of the inlined function */
+    symbolMemaddr              lowaddr;    /* Address range of this inlined copy (inclusive) */
+    symbolMemaddr              highaddr;
+};
+
 struct symbol
 {
     char **stringTable[PT_NUMTABLES];      /* Strings that we don't want to duplicate, so we give them an index */
@@ -76,6 +84,9 @@ struct symbol
 
     struct symbolFunctionStore **func;     /* Table of functions, sorted by start address */
     unsigned int nfunc;                    /* Number of entries in function table */
+
+    struct symbolInlineStore *inl;         /* Table of inlined copies of functions (unsorted) */
+    unsigned int ninl;                     /* Number of entries in inline table */
 
     struct symbolLineStore **line;         /* Table of source code address indexes, sorted by start address */
     unsigned int nlines;                   /* Number of lines in source code line table */
@@ -99,6 +110,9 @@ struct symbolFunctionStore *symbolFunctionAt( struct symbol *p, symbolMemaddr ad
 
 /* Get indexed function, or NULL if out of range */
 struct symbolFunctionStore *symbolFunctionIndex( struct symbol *p, unsigned int index );
+
+/* Get indexed inlined copy of a function (address range of code inlined into another function), or NULL */
+struct symbolInlineStore *symbolInlineIndex( struct symbol *p, unsigned int index );
 
 /* Get indexed line, or NULL if out of range */
 struct symbolLineStore *symbolLineIndex( struct symbol *p, unsigned int index );
