@@ -121,7 +121,7 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
 
 {
     FILE *c;
-    uint32_t functionidx, dfunctionidx, fileidx;
+    uint32_t functionidx, dfunctionidx, fileidx, dfileidx;
     uint64_t cnt;
     struct subcall *s;
 
@@ -143,7 +143,8 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
     {
         return false;
     }
-    fprintf( c, "graph calls\n{\n  overlap=true; splines=true; size=\"7.75,10.25\"; orientation=portrait; sep=0.1; nodesep=1;\n" );
+    /* Directed, so each edge points from the caller to the callee */
+    fprintf( c, "digraph calls\n{\n  overlap=true; splines=true; size=\"7.75,10.25\"; orientation=portrait; sep=0.1; nodesep=1;\n" );
 
     /* An earlier sort (e.g. by the other writer) may have left the caller's head pointer in */
     /* the middle of the list, and sorting from there would drop the elements before it.     */
@@ -165,6 +166,7 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
         fileidx = s->srch->fileindex;
 
         dfunctionidx = s->dsth->functionindex;
+        dfileidx = s->dsth->fileindex;
         cnt = s->count;
         s = s->hh.next;
 
@@ -174,8 +176,9 @@ bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct Symbol
             s = s->hh.next;
         }
 
-        fprintf( c, "    \"\n(%s)\n%s\n\n\" -- ", SymbolFilename( ss, fileidx ), SymbolFunction( ss, functionidx ) );
-        fprintf( c, "\"\n(%s)\n%s\n\n\" [label=%" PRIu64 ", weight=0.1 ];\n", SymbolFilename( ss, fileidx ), SymbolFunction( ss, dfunctionidx ), cnt );
+        /* Each end in its own file; '/' separators, since dot takes '\' as an escape */
+        fprintf( c, "    \"\n(%s)\n%s\n\n\" -> ", _path( NULL, SymbolFilename( ss, fileidx ) ), SymbolFunction( ss, functionidx ) );
+        fprintf( c, "\"\n(%s)\n%s\n\n\" [label=%" PRIu64 ", weight=0.1 ];\n", _path( NULL, SymbolFilename( ss, dfileidx ) ), SymbolFunction( ss, dfunctionidx ), cnt );
     }
 
     fprintf( c, "}\n" );
