@@ -43,7 +43,8 @@ enum TRACE_ETM4protoState
     TRACE_GET_VCONTEXT,
     TRACE_GET_CONTEXT_ID,
     TRACE_GET_EXCEPTIONINFO1,
-    TRACE_GET_EXCEPTIONINFO2
+    TRACE_GET_EXCEPTIONINFO2,
+    TRACE_GET_CC_F2
 };
 
 static const char *_protoStateName[] =
@@ -68,7 +69,8 @@ static const char *_protoStateName[] =
     "GET_VCONTEXT",
     "GET_CONTEXT_ID",
     "GET_EXCEPTIONINFO1",
-    "GET_EXCEPTIONINFO2"
+    "GET_EXCEPTIONINFO2",
+    "GET_CC_F2"
 };
 
 #define COND_LOAD_TRACED  1
@@ -99,6 +101,8 @@ struct ETM4DecodeState
     uint32_t nextrhkey;          /* Next rh key expected in the stream */
     uint32_t spec;               /* Max speculation depth to be expected */
     uint32_t cyct;               /* Cycnt threshold */
+    uint32_t infoVal;            /* Trace info section under construction (multi-byte) */
+    uint8_t infoIdx;             /* Bytes of it received */
 
     uint8_t ex0;                 /* First info byte for exception */
 
@@ -158,6 +162,69 @@ static void _stackQ( struct ETM4DecodeState *j )
     j->q[1].addr = j->q[0].addr;
     j->q[2].inst = j->q[1].inst;
     j->q[1].inst = j->q[0].inst;
+}
+
+// ====================================================================================================
+
+static void _addCycles( struct TRACECPUState *cpu, uint64_t n )
+
+/* Cycle count packets report the cycles since the previous one */
+
+{
+    if ( cpu->cycleCount == COUNT_UNKNOWN )
+    {
+        cpu->cycleCount = n;
+    }
+    else
+    {
+        cpu->cycleCount += n;
+    }
+
+    _stateChange( cpu, EV_CH_CYCLECOUNT );
+}
+
+// ====================================================================================================
+
+static enum TRACE_ETM4protoState _nextInfoSection( struct ETM4DecodeState *j, int after )
+
+/* The trace info sections present (PLCTL bits 0..3: INFO, KEY, SPEC, CYCT),
+ * the first one after section 'after'; TRACE_IDLE when none is left. Each section is a
+ * multi-byte field: 7 bits per byte, bit 7 set while more bytes follow. */
+
+{
+    static const enum TRACE_ETM4protoState s[4] =
+    {
+        TRACE_GET_INFO_INFO, TRACE_GET_INFO_KEY, TRACE_GET_INFO_SPEC, TRACE_GET_INFO_CYCT
+    };
+
+    j->infoVal = 0;
+    j->infoIdx = 0;
+
+    for ( int i = after + 1; i < 4; i++ )
+    {
+        if ( j->plctl & ( 1 << i ) )
+        {
+            return s[i];
+        }
+    }
+
+    return TRACE_IDLE;
+}
+
+// ====================================================================================================
+
+static bool _infoByte( struct ETM4DecodeState *j, uint8_t c )
+
+/* One byte of a trace info section into infoVal; true when the section is complete */
+
+{
+    if ( j->infoIdx < 5 )
+    {
+        j->infoVal |= ( uint32_t )( c & 0x7f ) << ( 7 * j->infoIdx );
+    }
+
+    j->infoIdx++;
+    return ( !( c & 0x80 ) ) || ( j->infoIdx == 5 );
 }
 
 // ====================================================================================================
@@ -406,7 +473,13 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
                     case 0b10010000 ... 0b10010011: /* Exact Match Address */
                         match = c & 0x03;
-                        assert( c != 3 ); /* This value is reserved */
+
+                        if ( match == 3 ) /* This value is reserved: a damaged stream, not a reason to abort */
+                        {
+                            DEBUG( "Reserved exact match address 0x%02x" EOL, c );
+                            break;
+                        }
+
                         cpu->addr = j->q[match].addr;
                         retVal = TRACE_EV_MSG_RXED;
                         _stateChange( cpu, EV_CH_ADDRESS );
@@ -454,12 +527,12 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         break;
 
 
-                    case 0b10011110: /* Long address, 64 bit, IS0, Figure 6.34 Pg 6-295 */
+                    case 0b10011110: /* Long address, 64 bit, IS1, Figure 6.34 Pg 6-295 */
                         j->idx = 1;
                         _stackQ( j );
                         j->haveContext = false;
                         j->q[0].inst = IS1;
-                        j->q[0].addr &= 0xFFFFFFFC;
+                        j->q[0].addr &= ~1ULL;
                         newState = TRACE_GET_64BIT_ADDR;
                         break;
 
@@ -505,7 +578,7 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         _stackQ( j );
                         j->haveContext = true;
                         j->q[0].inst = IS1;
-                        j->q[0].addr &= 0xFFFFFFFC;
+                        j->q[0].addr &= ~1ULL;
                         newState = TRACE_GET_64BIT_ADDR;
                         break;
 
@@ -563,7 +636,37 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         break;
 
                     case 0b00101101: /* Commit instruction trace packet, Figure 6-17, Pg 6-277 */
+                        j->idx = 0;
                         newState = TRACE_COMMIT;
+                        break;
+
+                    case 0b00001100 ... 0b00001101: /* Cycle count format 2: one payload byte */
+                        newState = TRACE_GET_CC_F2;
+                        break;
+
+                    case 0b00001110 ... 0b00001111: /* Cycle count format 1 */
+
+                        /* Assumes no COMMIT section in this packet (TRCIDR0.COMMOPT == 1), as on
+                         * Cortex-M cores, which do not trace speculatively. U (bit 0) set: no
+                         * COUNT section, the count is unknown. */
+                        if ( c & 1 )
+                        {
+                            cpu->cycleCount = COUNT_UNKNOWN;
+                            _stateChange( cpu, EV_CH_CYCLECOUNT );
+                            retVal = TRACE_EV_MSG_RXED;
+                        }
+                        else
+                        {
+                            j->idx = 0;
+                            j->cntUpdate = 0;
+                            newState = TRACE_GET_CYCLECOUNT;
+                        }
+
+                        break;
+
+                    case 0b00010000 ... 0b00011111: /* Cycle count format 3: count in bits 1:0, commit in 3:2 */
+                        _addCycles( cpu, ( c & 3 ) + j->cyct );
+                        retVal = TRACE_EV_MSG_RXED;
                         break;
 
                     default:
@@ -624,21 +727,26 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             // -----------------------------------------------------
 
             case TRACE_GET_VCONTEXT:
-                j->vcontext |= c << j->idx;
+                j->vcontext |= ( uint32_t )c << j->idx;
                 j->idx += 8;
 
-                if ( ( j->idx == 32 ) && ( !j->haveContext ) )
+                if ( j->idx == 32 )
                 {
+                    /* VMID complete; the context ID follows if the C bit was set */
                     cpu->vmid = j->vcontext;
-                    retVal = TRACE_EV_MSG_RXED;
                     _stateChange( cpu, EV_CH_VMID );
-                    newState = TRACE_IDLE;
-                }
-                else
-                {
-                    j->context = 0;
-                    j->idx = 0;
-                    newState = TRACE_GET_CONTEXT_ID;
+
+                    if ( j->haveContext )
+                    {
+                        j->context = 0;
+                        j->idx = 0;
+                        newState = TRACE_GET_CONTEXT_ID;
+                    }
+                    else
+                    {
+                        retVal = TRACE_EV_MSG_RXED;
+                        newState = TRACE_IDLE;
+                    }
                 }
 
                 break;
@@ -646,12 +754,12 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             // -----------------------------------------------------
 
             case TRACE_GET_CONTEXT_ID:
-                j->context |= c << j->idx;
+                j->context |= ( uint32_t )c << j->idx;
                 j->idx += 8;
 
                 if ( j->idx == 32 )
                 {
-                    cpu->contextID = j->vcontext;
+                    cpu->contextID = j->context;
                     retVal = TRACE_EV_MSG_RXED;
                     _stateChange( cpu, EV_CH_CONTEXTID );
                     newState = TRACE_IDLE;
@@ -727,23 +835,24 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             // -----------------------------------------------------
 
             case TRACE_GET_64BIT_ADDR: /* Long format 64 bit address for IS0 or IS1, offset set by idx. Figure 6-34, Pg 6-295 */
+                /* As the 32 bit form, with 64 bit masks: clear the bits being replaced (& ~) */
                 if ( j->idx < 3 )
                 {
                     /* First byte of received data */
-                    j->q[0].addr = ( j->q[0].addr & ( 0x7F << j->idx ) ) | ( ( c & 0x7f ) << ( j->idx ) );
+                    j->q[0].addr = ( j->q[0].addr & ~( 0x7FULL << j->idx ) ) | ( ( uint64_t )( c & 0x7f ) << j->idx );
                     j->idx += 7;
                 }
                 else
                 {
-                    if ( ( j->q[0].inst == IS1 ) && ( j->idx == 8 ) )
+                    if ( j->idx == 9 )
                     {
-                        /* Second byte of IS1 case - mask MSB */
-                        j->q[0].addr = ( j->q[0].addr & ( 0x7F << j->idx ) ) | ( ( c & 0x7f ) << ( j->idx ) );
+                        /* Second byte of IS0 case - 7 bits */
+                        j->q[0].addr = ( j->q[0].addr & ~( 0x7FULL << j->idx ) ) | ( ( uint64_t )( c & 0x7f ) << j->idx );
                         j->idx = 16;
                     }
                     else
                     {
-                        j->q[0].addr = ( j->q[0].addr & ( 0xFF << j->idx ) ) | ( ( c & 0xFf ) << ( j->idx ) );
+                        j->q[0].addr = ( j->q[0].addr & ~( 0xFFULL << j->idx ) ) | ( ( uint64_t )c << j->idx );
                         j->idx += 8;
                     }
                 }
@@ -768,13 +877,14 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
             // -----------------------------------------------------
             case TRACE_GET_TIMESTAMP: /* Timestamp, Figure 6-7, Pg 6-264 */
+                /* Only the bits sent change: clear them (& ~), 64 bit shifts */
                 if ( j->idx < 56 )
                 {
-                    cpu->ts = ( cpu->ts & ( 0x7F << j->idx ) ) | ( ( c & 0x7f ) << j->idx );
+                    cpu->ts = ( cpu->ts & ~( 0x7FULL << j->idx ) ) | ( ( uint64_t )( c & 0x7f ) << j->idx );
                 }
                 else
                 {
-                    cpu->ts = ( cpu->ts & ( 0xFF << j->idx ) ) | ( ( c & 0xff ) << j->idx );
+                    cpu->ts = ( cpu->ts & ~( 0xFFULL << j->idx ) ) | ( ( uint64_t )c << j->idx );
                 }
 
                 j->idx += 7;
@@ -811,23 +921,46 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
             // -----------------------------------------------------
             case TRACE_GET_TS_CC: /* Part of timestamp, Figure 6-7, Pg 6-264 */
-                if ( j->idx < 2 )
-                {
-                    j->cntUpdate |= ( c & 0x7f ) << ( j->idx * 7 );
-                }
-                else
-                {
-                    j->cntUpdate |= ( c & 0x7f ) << ( j->idx * 7 );
-                }
-
+                /* 7 bits per byte, bit 7 set while more follow; the third byte is the last */
+                j->cntUpdate |= ( uint32_t )( c & 0x7f ) << ( j->idx * 7 );
                 j->idx++;
 
-                if ( ( j->idx == 3 ) || ( c & 0x80 ) )
+                if ( ( j->idx == 3 ) || ( !( c & 0x80 ) ) )
                 {
-
-                    cpu->cycleCount += j->cntUpdate;
+                    _addCycles( cpu, j->cntUpdate );
                     retVal = TRACE_EV_MSG_RXED;
-                    _stateChange( cpu, EV_CH_CYCLECOUNT );
+                    newState = TRACE_IDLE;
+                }
+
+                break;
+
+            // -----------------------------------------------------
+            case TRACE_GET_CYCLECOUNT: /* COUNT section of cycle count format 1, as in the timestamp */
+                j->cntUpdate |= ( uint32_t )( c & 0x7f ) << ( j->idx * 7 );
+                j->idx++;
+
+                if ( ( j->idx == 3 ) || ( !( c & 0x80 ) ) )
+                {
+                    _addCycles( cpu, j->cntUpdate );
+                    retVal = TRACE_EV_MSG_RXED;
+                    newState = TRACE_IDLE;
+                }
+
+                break;
+
+            // -----------------------------------------------------
+            case TRACE_GET_CC_F2: /* Cycle count format 2 payload: count in bits 3:0, commit in 7:4 */
+                _addCycles( cpu, ( c & 0x0f ) + j->cyct );
+                retVal = TRACE_EV_MSG_RXED;
+                newState = TRACE_IDLE;
+                break;
+
+            // -----------------------------------------------------
+            case TRACE_COMMIT: /* COMMIT field: 7 bits per byte, bit 7 set while more follow, 5 bytes at most */
+                j->idx++;
+
+                if ( ( !( c & 0x80 ) ) || ( j->idx == 5 ) )
+                {
                     newState = TRACE_IDLE;
                 }
 
@@ -870,93 +1003,47 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             case TRACE_GET_INFO_PLCTL:
                 j->plctl = c;
                 j->nextrhkey = 0;
+                j->spec = 0;
+                j->cyct = 0;
                 _flushQ( j ); /* Reset the address stack too ( Section 6.4.12, Pg 6-291 ) */
-
-                if ( j->plctl & ( 1 << 0 ) )
-                {
-                    newState = TRACE_GET_INFO_INFO;
-                }
-                else if ( j->plctl & ( 1 << 1 ) )
-                {
-                    newState = TRACE_GET_INFO_KEY;
-                }
-                else if ( j->plctl & ( 1 << 2 ) )
-                {
-                    newState = TRACE_GET_INFO_SPEC;
-                }
-                else if ( j->plctl & ( 1 << 3 ) )
-                {
-                    newState = TRACE_GET_INFO_CYCT;
-                }
-                else
-                {
-                    _reportInfo( cpu, j );
-                    retVal = TRACE_EV_MSG_RXED;
-                    newState = TRACE_IDLE;
-                }
-
+                newState = _nextInfoSection( j, -1 );
                 break;
 
             case TRACE_GET_INFO_INFO:
-                j->cc_enabled   = ( 0 != ( c & ( 1 << 0 ) ) );
-                j->cond_enabled = ( c << 1 ) & 7;
-                j->load_traced  = ( 0 != ( c & ( 1 << 4 ) ) );
-                j->store_traced = ( 0 != ( c & ( 1 << 5 ) ) );
-
-                if ( j->plctl & ( 1 << 1 ) )
+                if ( _infoByte( j, c ) )
                 {
-                    newState = TRACE_GET_INFO_KEY;
-                }
-                else if ( j->plctl & ( 1 << 2 ) )
-                {
-                    newState = TRACE_GET_INFO_SPEC;
-                }
-                else if ( j->plctl & ( 1 << 3 ) )
-                {
-                    newState = TRACE_GET_INFO_CYCT;
-                }
-                else
-                {
-                    _reportInfo( cpu, j );
-                    retVal = TRACE_EV_MSG_RXED;
-                    newState = TRACE_IDLE;
+                    j->cc_enabled   = ( 0 != ( j->infoVal & ( 1 << 0 ) ) );
+                    j->cond_enabled = ( j->infoVal >> 1 ) & 7;
+                    j->load_traced  = ( 0 != ( j->infoVal & ( 1 << 4 ) ) );
+                    j->store_traced = ( 0 != ( j->infoVal & ( 1 << 5 ) ) );
+                    newState = _nextInfoSection( j, 0 );
                 }
 
                 break;
 
             case TRACE_GET_INFO_KEY:
-                j->nextrhkey = c;  // FIXME: Greater than 256 keys???
-
-                if ( j->plctl & ( 1 << 2 ) )
+                if ( _infoByte( j, c ) )
                 {
-                    newState = TRACE_GET_INFO_SPEC;
-                }
-                else if ( j->plctl & ( 1 << 3 ) )
-                {
-                    newState = TRACE_GET_INFO_CYCT;
-                }
-                else
-                {
-                    _reportInfo( cpu, j );
-                    retVal = TRACE_EV_MSG_RXED;
-                    newState = TRACE_IDLE;
+                    j->nextrhkey = j->infoVal;
+                    newState = _nextInfoSection( j, 1 );
                 }
 
                 break;
 
             case TRACE_GET_INFO_SPEC:
-                j->spec = c;
-
-                if ( j->plctl & ( 1 << 3 ) )
+                if ( _infoByte( j, c ) )
                 {
-                    _reportInfo( cpu, j );
-                    newState = TRACE_GET_INFO_CYCT;
+                    j->spec = j->infoVal;
+                    newState = _nextInfoSection( j, 2 );
                 }
-                else
+
+                break;
+
+            case TRACE_GET_INFO_CYCT: /* Cycle count threshold, used by cycle count formats 2 and 3 */
+                if ( _infoByte( j, c ) )
                 {
-                    _reportInfo( cpu, j );
-                    retVal = TRACE_EV_MSG_RXED;
-                    newState = TRACE_IDLE;
+                    j->cyct = j->infoVal;
+                    newState = _nextInfoSection( j, 3 );
                 }
 
                 break;
@@ -967,6 +1054,13 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                 DEBUG( "Case %d not handled in switch" EOL, j->p );
                 break;
         }
+    }
+
+    /* Trace info packet complete */
+    if ( ( newState == TRACE_IDLE ) && ( j->p >= TRACE_GET_INFO_PLCTL ) && ( j->p <= TRACE_GET_INFO_CYCT ) )
+    {
+        _reportInfo( cpu, j );
+        retVal = TRACE_EV_MSG_RXED;
     }
 
     if ( j->p != TRACE_UNSYNCED )
