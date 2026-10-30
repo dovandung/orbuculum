@@ -343,7 +343,7 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                     case 0b11000000 ... 0b11010100:
                     case 0b11100000 ... 0b11110100: /* Atom format 6, Figure 6-44, Pg 6.307 */
                         cpu->eatoms = ( c & 0x1f ) + 4;
-                        cpu->instCount = cpu->eatoms;
+                        cpu->instCount += cpu->eatoms;
                         cpu->disposition = ( 1 << ( cpu->eatoms ) ) - 1;
 
                         /* Deal with last instruction to be executed */

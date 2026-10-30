@@ -54,7 +54,8 @@ static uint64_t _lostInstructions;
 struct _subcallAccount
 {
     struct subcallSig sig;
-    uint64_t inTicks;
+    uint64_t inTicks;                    /* Instructions executed when the call was made */
+    uint64_t inVisits;                   /* Source line visits when the call was made */
 };
 
 
@@ -142,6 +143,8 @@ struct RunTime
 
     /* Stats about the run */
     int instCount;                              /* Number of instruction locations */
+    uint64_t instExecuted;                      /* Instructions executed (the Inst cost) */
+    uint64_t lineVisits;                        /* Source line visits (the Visits cost) */
     uint64_t callsCount;                        /* Call data count */
     uint64_t intervalBytes;                     /* Number of bytes transferred in current interval */
 
@@ -188,8 +191,14 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
 /* This is a call or a return, manipulate stack tracking appropriately */
 
 {
-    struct TRACECPUState *cpu = TRACECPUState( &r->i );
     struct subcall *s;
+
+    /* A call never goes to the address it returns to. That is an exception return seen as */
+    /* an exception entry, so it isn't a call.                                              */
+    if ( retAddr == to )
+    {
+        return;
+    }
 
     /* ...add it to the call stack */
     r->substack = ( struct _subcallAccount * )realloc( r->substack, ( r->substacklen + 1 ) * sizeof( struct _subcallAccount ) );
@@ -197,7 +206,8 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     /* This is a call */
     r->substack[r->substacklen].sig.src     = retAddr;
     r->substack[r->substacklen].sig.dst     = to;
-    r->substack[r->substacklen].inTicks     = cpu->instCount;
+    r->substack[r->substacklen].inTicks     = r->instExecuted;
+    r->substack[r->substacklen].inVisits    = r->lineVisits;
 
     /* Find a record for this source/dest pair */
     HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
@@ -223,60 +233,79 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     DBG_OUT( "INC:%3d %08x -> %08x" EOL, r->substacklen, retAddr, to );
 }
 // ====================================================================================================
-static void _returnEvent( struct RunTime *r, uint32_t to )
+static uint32_t _returnEvent( struct RunTime *r, uint32_t to, bool mustMatch )
 
-/* This is a return, manipulate stack tracking appropriately */
+/* This is a return to 'to'. Close the calls down to the one that returns there. If no call */
+/* on the stack does (the trace didn't say where this return went, or the call was missed), */
+/* close just the innermost one, or none if mustMatch. Returns the address the last closed  */
+/* call returns to, or 0 if none was closed.                                                */
 
 {
-    struct TRACECPUState *cpu = TRACECPUState( &r->i );
     struct subcall *s;
-    uint32_t orig = r->substacklen;
+    struct _subcallAccount *a;
+    uint32_t depth = r->substacklen;
+    uint32_t src = 0;
 
-    /* Cover the startup case that we happen to hit a return before a call */
-    if ( !r->substack )
+    while ( ( depth ) && ( r->substack[depth - 1].sig.src != to ) )
     {
-        return;
+        depth--;
     }
 
-    /* Check we've got a valid stack entry to match to */
-    do
+    if ( !depth )
     {
-        if ( !r->substacklen )
+        if ( ( mustMatch ) || ( !r->substacklen ) )
         {
-            DBG_OUT( "OUT OUT OF STACK ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^" EOL );
-            break;
+            DBG_OUT( "NO CALL RETURNS TO %08x" EOL, to );
+            return 0;
         }
 
-        /* The -1th entry was the last written, so see if that is back far enough */
-        r->substacklen--;
+        depth = r->substacklen;
+    }
+
+    while ( r->substacklen >= depth )
+    {
+        /* We don't bother deallocating memory here cos it'll be done the next time we make a call */
+        a = &r->substack[--r->substacklen];
 
 #ifdef ORBPROFILE_DEBUG
+
         for ( uint32_t g = 0; g < r->substacklen + 1; g++ )
         {
             putchar( ' ' );
         }
+
 #endif
 
-        DBG_OUT( " DEC:%3d %08x " EOL, r->substacklen + 1, r->substack[r->substacklen].sig.src );
-        HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
+        DBG_OUT( " DEC:%3d %08x (wanted %08x)" EOL, r->substacklen + 1, a->sig.src, to );
+        HASH_FIND( hh, r->subhead, &a->sig, sizeof( struct subcallSig ), s );
         assert( s );
 
-        /* We don't bother deallocating memory here cos it'll be done the next time we make a call */
-        s->myCost += cpu->instCount - r->substack[r->substacklen].inTicks;
+        /* Inclusive costs: what was executed and visited while this call was open */
+        s->myCost   += r->instExecuted - a->inTicks;
+        s->myVisits += r->lineVisits - a->inVisits;
         s->count++;
+        src = a->sig.src;
     }
-    while ( to != r->substack[r->substacklen].sig.src );
 
-    /* Check function we popped back to matches where we think we should be */
-    if ( to != r->substack[r->substacklen].sig.src )
+    return src;
+}
+// ====================================================================================================
+static bool _isFunctionEntry( struct RunTime *r, uint32_t addr )
+
+/* Exception handlers are entered at their first instruction, so an address is a function   */
+/* entry if the code just before it is not part of the same function. Exception returns go  */
+/* back into the middle of the interrupted function.                                        */
+
+{
+    struct nameEntry n;
+    struct nameEntry p;
+
+    if ( !SymbolLookup( r->s, addr, &n ) )
     {
-        for ( uint32_t ty = 0; ty < orig; ty++ )
-        {
-            DBG_OUT( "%d:%08X ", ty, r->substack[ty].sig.src );
-        }
-
-        DBG_OUT( "(wanted %08x, got %08x)" EOL, to, r->substack[r->substacklen].sig.src );
+        return false;
     }
+
+    return ( !SymbolLookup( r->s, addr - 2, &p ) ) || ( p.functionindex != n.functionindex );
 }
 // ====================================================================================================
 static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntryHash **h )
@@ -419,11 +448,13 @@ static void _handleInstruction( struct RunTime *r, bool actioned )
 
     /* OK, by hook or by crook we've got an address entry now, so increment the number of executions */
     r->op.h->count++;
+    r->instExecuted++;
 
     /* If source postion changed then update source code line visitation counts too */
     if ( ( r->op.oldh ) && ( ( r->op.h->line != r->op.oldh->line ) || ( r->op.h->functionindex != r->op.oldh->functionindex ) ) )
     {
         r->op.h->scount++;
+        r->lineVisits++;
     }
 
     /* If this is a computable destination then action it */
@@ -440,15 +471,19 @@ static void _handleInstruction( struct RunTime *r, bool actioned )
 }
 
 // ====================================================================================================
-static void _checkJumps( struct RunTime *r )
+static uint32_t _checkJumps( struct RunTime *r, bool actioned )
+
+/* Account the call or return made by the instruction just handled, if it executed. Returns */
+/* the address the closed call returns to if it was a return, or 0.                         */
 
 {
-    if ( r->op.h )
-    {
+    uint32_t popped = 0;
 
-        if ( ( TRACEStateChanged( &r->i, EV_CH_EX_EXIT ) ) || ( r->op.h->isReturn ) )
+    if ( ( r->op.h ) && ( actioned ) )
+    {
+        if ( r->op.h->isReturn )
         {
-            _returnEvent( r, r->op.workingAddr );
+            popped = _returnEvent( r, r->op.workingAddr, false );
         }
 
         if ( r->op.h->isSubCall )
@@ -456,6 +491,8 @@ static void _checkJumps( struct RunTime *r )
             _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), r->op.workingAddr );
         }
     }
+
+    return popped;
 }
 // ====================================================================================================
 static void _traceCB( void *d )
@@ -484,16 +521,18 @@ static void _traceCB( void *d )
             r->sampling  = true;
         }
 
-        /* Create false entry for an interrupt source */
-        r->op.inth = calloc( 1, sizeof( struct execEntryHash ) );
+        /* Create false entry for an unknown position. It isn't executed code, so it isn't */
+        /* added to the instruction table (it would be written to the profile).             */
+        if ( !r->op.inth )
+        {
+            r->op.inth = calloc( 1, sizeof( struct execEntryHash ) );
 
-        MEMCHECKV( r->op.inth );
-        r->op.inth->addr          = INTERRUPT;
-        r->op.inth->fileindex     = INTERRUPT;
-        r->op.inth->line          = NO_LINE;
-        r->op.inth->count         = NO_LINE;
-        r->op.inth->functionindex = INTERRUPT;
-        HASH_ADD_INT( r->insthead, addr, r->op.inth );
+            MEMCHECKV( r->op.inth );
+            r->op.inth->addr          = INTERRUPT;
+            r->op.inth->fileindex     = INTERRUPT;
+            r->op.inth->line          = NO_LINE;
+            r->op.inth->functionindex = INTERRUPT;
+        }
     }
 
     r->op.lasttstamp = cpu->instCount;
@@ -502,6 +541,16 @@ static void _traceCB( void *d )
 
     if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
     {
+        /* Reading a change clears it, so collect what came with these atoms once */
+        bool newAddr = TRACEStateChanged( &r->i, EV_CH_ADDRESS );
+        bool exEntry = TRACEStateChanged( &r->i, EV_CH_EX_ENTRY );
+        bool exExit  = TRACEStateChanged( &r->i, EV_CH_EX_EXIT );
+        uint32_t popped = 0;
+
+        /* An exception is taken when the new address is the start of a handler. A branch with */
+        /* exception information back into the middle of a function is an exception return.    */
+        bool interrupt = newAddr && exEntry && _isFunctionEntry( r, cpu->addr );
+
         /* We are going to execute some instructions. Check if the last of the old batch of    */
         /* instructions was cancelled and, if it wasn't and it's still outstanding, action it. */
         if ( TRACEStateChanged( &r->i, EV_CH_CANCELLED ) )
@@ -517,23 +566,32 @@ static void _traceCB( void *d )
 
                 if ( ( r->op.h->isJump ) || ( r->op.h->isSubCall ) || ( r->op.h->isReturn ) )
                 {
-                    if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
+                    /* The new address is where this branch went, unless it is an exception handler */
+                    if ( ( newAddr ) && ( !interrupt ) )
                     {
                         DBG_OUT( "New addr %08x" EOL, cpu->addr );
                         r->op.workingAddr = cpu->addr;
+                        newAddr = false;
                     }
 
-                    _checkJumps( r );
+                    popped = _checkJumps( r, disposition & 1 );
                 }
             }
         }
 
-        if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
+        if ( newAddr )
         {
-            if ( TRACEStateChanged( &r->i, EV_CH_EX_ENTRY ) )
+            if ( interrupt )
             {
+                /* The exception is a call from where the interrupted code resumes. After a return */
+                /* the trace gave no destination for (tail-chaining), that is where it returned to. */
                 DBG_OUT( "INTERRUPT!!" EOL );
-                _callEvent( r, r->op.workingAddr, cpu->addr );
+                _callEvent( r, ( ( ( r->op.workingAddr & SPECIALS_MASK ) == SPECIALS_MASK ) && ( popped ) ) ? popped : r->op.workingAddr, cpu->addr );
+            }
+            else if ( ( ( exEntry ) || ( exExit ) ) && ( !popped ) )
+            {
+                /* Exception return without a return instruction seen: close the interrupt call */
+                _returnEvent( r, cpu->addr, true );
             }
 
             r->op.workingAddr = cpu->addr;
@@ -552,7 +610,7 @@ static void _traceCB( void *d )
         {
             incAddr--;
             _handleInstruction( r, disposition & 1 );
-            _checkJumps( r );
+            _checkJumps( r, disposition & 1 );
             disposition >>= 1;
         }
     }

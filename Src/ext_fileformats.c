@@ -23,7 +23,11 @@ static int _inst_sort_fn( const void *a, const void *b )
 /* Sort instructions by address */
 
 {
-    return ( int )( ( ( struct execEntryHash * )a )->addr ) - ( int )( ( ( struct execEntryHash * )b )->addr );
+    uint32_t aa = ( ( struct execEntryHash * )a )->addr;
+    uint32_t ba = ( ( struct execEntryHash * )b )->addr;
+
+    /* Unsigned compare: a difference cast to int puts addresses from 0x80000000 up first */
+    return ( aa > ba ) - ( aa < ba );
 }
 // ====================================================================================================
 static int _calls_src_sort_fn( const void *a, const void *b )
@@ -172,8 +176,30 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         fprintf( c, "creator: orbprofile\npositions: instr line\nevent: Inst : CPU Instructions\nevents: Inst\n" );
     }
 
-    /* Samples are in time order, so we can determine the extent of time.... */
-    fprintf( c, "summary: %" PRIu64 "\n", timelen );
+    /* The summary is the total of each event. Placeholder records (unknown or interrupt */
+    /* positions) aren't executed code, so they are left out here and below.             */
+    uint64_t totalInst = 0;
+    uint64_t totalVisits = 0;
+
+    for ( struct execEntryHash *t = insthead; t; t = t->hh.next )
+    {
+        if ( ( t->addr & SPECIALS_MASK ) != SPECIALS_MASK )
+        {
+            totalInst   += t->count;
+            totalVisits += t->scount;
+        }
+    }
+
+    fprintf( c, "# trace length: %" PRIu64 "\n", timelen );
+
+    if ( includeVisits )
+    {
+        fprintf( c, "summary: %" PRIu64 " %" PRIu64 "\n", totalInst, totalVisits );
+    }
+    else
+    {
+        fprintf( c, "summary: %" PRIu64 "\n", totalInst );
+    }
 
     /* Try to remove frontmatter off the elfile if nessessary and possible */
     if ( deleteMaterial )
@@ -199,6 +225,12 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
 
     while ( f )
     {
+        if ( ( f->addr & SPECIALS_MASK ) == SPECIALS_MASK )
+        {
+            f = f->hh.next;
+            continue;
+        }
+
         SymbolLookup( ss, f->addr, &n );
 
         if ( prevfile != n.fileindex )
@@ -209,6 +241,9 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         if ( prevfn != n.functionindex )
         {
             fprintf( c, "fn=(%u) %s\n", n.functionindex & HANDLE_MASK, SymbolFunction( ss, n.functionindex ) );
+
+            /* Start each function with an absolute position */
+            prevline = NO_LINE;
         }
 
         if ( ( prevline == NO_LINE ) || ( prevaddr == NO_FUNCTION ) )
@@ -262,22 +297,26 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         /* Now publish the call destination. By definition is is known, so can be shortformed */
         if ( prevfile != s->srch->fileindex )
         {
-            fprintf( c, "fl=(%u)\n", s->srch->fileindex & HANDLE_MASK );
+            fprintf( c, "fl=(%u) %s%s\n", s->srch->fileindex & HANDLE_MASK, deleteMaterial ? deleteMaterial : "", SymbolFilename( ss, s->srch->fileindex ) );
             prevfile = s->srch->fileindex;
         }
 
         if ( prevfn != s->srch->functionindex )
         {
-            fprintf( c, "fn=(%u)\n", s->srch->functionindex & HANDLE_MASK );
+            fprintf( c, "fn=(%u) %s\n", s->srch->functionindex & HANDLE_MASK, SymbolFunction( ss, s->srch->functionindex ) );
             prevfn = s->srch->functionindex;
         }
 
-        fprintf( c, "cfl=(%d)\ncfn=(%d)\n", s->dsth->fileindex, s->dsth->functionindex );
+        /* Same (masked) ids as fl= and fn=, named, since the callee may not have run any code */
+        fprintf( c, "cfl=(%u) %s%s\ncfn=(%u) %s\n",
+                 s->dsth->fileindex & HANDLE_MASK, deleteMaterial ? deleteMaterial : "", SymbolFilename( ss, s->dsth->fileindex ),
+                 s->dsth->functionindex & HANDLE_MASK, SymbolFunction( ss, s->dsth->functionindex ) );
         fprintf( c, "calls=%" PRIu64 " 0x%08x %d\n", s->count, s->sig.dst, s->dsth->line );
 
+        /* The cost after calls= is the inclusive cost of those calls */
         if ( includeVisits )
         {
-            fprintf( c, "0x%08x %d %" PRIu64 " %" PRIu64 "\n", s->sig.src, s->srch->line, s->myCost, s->count );
+            fprintf( c, "0x%08x %d %" PRIu64 " %" PRIu64 "\n", s->sig.src, s->srch->line, s->myCost, s->myVisits );
         }
         else
         {
