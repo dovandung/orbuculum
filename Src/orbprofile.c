@@ -56,6 +56,7 @@ struct _subcallAccount
     struct subcallSig sig;
     uint64_t inTicks;                    /* Instructions executed when the call was made */
     uint64_t inVisits;                   /* Source line visits when the call was made */
+    uint64_t inCycles;                   /* Cycles when the call was made */
 };
 
 
@@ -145,6 +146,9 @@ struct RunTime
     int instCount;                              /* Number of instruction locations */
     uint64_t instExecuted;                      /* Instructions executed (the Inst cost) */
     uint64_t lineVisits;                        /* Source line visits (the Visits cost) */
+    uint64_t cyclesExecuted;                    /* Cycles of traced instructions (the Cycles cost) */
+    uint64_t pendingCycles;                     /* Cycles waiting for the next instruction to complete */
+    uint64_t packetCycles;                      /* Cycles reported in cycle count packets */
     uint64_t callsCount;                        /* Call data count */
     uint64_t intervalBytes;                     /* Number of bytes transferred in current interval */
 
@@ -208,6 +212,7 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     r->substack[r->substacklen].sig.dst     = to;
     r->substack[r->substacklen].inTicks     = r->instExecuted;
     r->substack[r->substacklen].inVisits    = r->lineVisits;
+    r->substack[r->substacklen].inCycles    = r->cyclesExecuted;
 
     /* Find a record for this source/dest pair */
     HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
@@ -283,6 +288,7 @@ static uint32_t _returnEvent( struct RunTime *r, uint32_t to, bool mustMatch )
         /* Inclusive costs: what was executed and visited while this call was open */
         s->myCost   += r->instExecuted - a->inTicks;
         s->myVisits += r->lineVisits - a->inVisits;
+        s->myCycles += r->cyclesExecuted - a->inCycles;
         s->count++;
         src = a->sig.src;
     }
@@ -423,7 +429,9 @@ static void _resolveCalls( struct RunTime *r )
     }
 }
 // ====================================================================================================
-static void _handleInstruction( struct RunTime *r, bool actioned )
+static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycles )
+
+/* Account one instruction (atom), which took 'cycles' (cycle accurate trace, else 0) */
 
 {
     /* ------------------------------------------------------------------------------------*/
@@ -448,7 +456,9 @@ static void _handleInstruction( struct RunTime *r, bool actioned )
 
     /* OK, by hook or by crook we've got an address entry now, so increment the number of executions */
     r->op.h->count++;
+    r->op.h->cycles += cycles;
     r->instExecuted++;
+    r->cyclesExecuted += cycles;
 
     /* If source postion changed then update source code line visitation counts too */
     if ( ( r->op.oldh ) && ( ( r->op.h->line != r->op.oldh->line ) || ( r->op.h->functionindex != r->op.oldh->functionindex ) ) )
@@ -495,6 +505,23 @@ static uint32_t _checkJumps( struct RunTime *r, bool actioned )
     return popped;
 }
 // ====================================================================================================
+static uint32_t _atomCycles( struct RunTime *r, uint32_t *budget )
+
+/* Cycles of the next atom: the waits before it, plus its own cycle while the P-header has one */
+
+{
+    uint32_t c = ( uint32_t )r->pendingCycles;
+
+    if ( *budget )
+    {
+        c++;
+        ( *budget )--;
+    }
+
+    r->pendingCycles = 0;
+    return c;
+}
+// ====================================================================================================
 static void _traceCB( void *d )
 
 /* Callback function for when valid TRACE decode is detected */
@@ -504,6 +531,8 @@ static void _traceCB( void *d )
     struct TRACECPUState *cpu = TRACECPUState( &r->i );
     static uint32_t incAddr        = 0;
     static uint32_t disposition    = 0;
+    static uint32_t deferredCycles = 0;
+    uint32_t cycleBudget           = 0;
 
     /* This routine gets called when valid data are available */
     /* if these are the first data, then reset counters etc.  */
@@ -539,8 +568,33 @@ static void _traceCB( void *d )
 
     /* Pull changes introduced by this event ============================== */
 
+    /* Cycle count packets (cycle accurate trace) report cycles not covered by P-headers */
+    if ( ( TRACEStateChanged( &r->i, EV_CH_CYCLECOUNT ) ) && ( r->sampling ) )
+    {
+        r->pendingCycles += cpu->cycleCount;
+        r->packetCycles  += cpu->cycleCount;
+    }
+
     if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
     {
+        if ( TRACEStateChanged( &r->i, EV_CH_WATOMS ) )
+        {
+            /* Cycle accurate: watoms cycles for these atoms. Waits beyond one per atom come  */
+            /* first (format 3), and belong to the next instruction to complete. If there are */
+            /* more atoms than cycles (format 2 and 4), the later atoms took no extra cycle.  */
+            uint32_t atoms = cpu->eatoms + cpu->natoms;
+            uint32_t lead  = ( cpu->watoms > atoms ) ? cpu->watoms - atoms : 0;
+
+            r->pendingCycles += lead;
+            cycleBudget = cpu->watoms - lead;
+
+            if ( !atoms )
+            {
+                /* Only waits: leave the outstanding instruction and any address for the next atoms */
+                return;
+            }
+        }
+
         /* Reading a change clears it, so collect what came with these atoms once */
         bool newAddr = TRACEStateChanged( &r->i, EV_CH_ADDRESS );
         bool exEntry = TRACEStateChanged( &r->i, EV_CH_EX_ENTRY );
@@ -555,14 +609,16 @@ static void _traceCB( void *d )
         /* instructions was cancelled and, if it wasn't and it's still outstanding, action it. */
         if ( TRACEStateChanged( &r->i, EV_CH_CANCELLED ) )
         {
+            /* Its cycles go to the next instruction that completes */
             DBG_OUT( "CANCELLED" EOL );
+            r->pendingCycles += deferredCycles;
         }
         else
         {
             if ( incAddr )
             {
                 DBG_OUT( "***" EOL );
-                _handleInstruction( r, disposition & 1 );
+                _handleInstruction( r, disposition & 1, deferredCycles );
 
                 if ( ( r->op.h->isJump ) || ( r->op.h->isSubCall ) || ( r->op.h->isReturn ) )
                 {
@@ -609,10 +665,13 @@ static void _traceCB( void *d )
         while ( incAddr > 1 )
         {
             incAddr--;
-            _handleInstruction( r, disposition & 1 );
+            _handleInstruction( r, disposition & 1, _atomCycles( r, &cycleBudget ) );
             _checkJumps( r, disposition & 1 );
             disposition >>= 1;
         }
+
+        /* ...whose cycles are kept until it is actioned */
+        deferredCycles = incAddr ? _atomCycles( r, &cycleBudget ) : 0;
     }
 }
 
@@ -1241,6 +1300,12 @@ int main( int argc, char *argv[] )
     if ( _lostInstructions )
     {
         genericsReport( V_INFO, "%" PRIu64 " instructions skipped where the trace position was not known" EOL, _lostInstructions );
+    }
+
+    if ( _r.cyclesExecuted )
+    {
+        genericsReport( V_INFO, "Cycle accurate: %" PRIu64 " cycles for %" PRIu64 " instructions (%" PRIu64 " from cycle count packets)" EOL,
+                        _r.cyclesExecuted, _r.instExecuted, _r.packetCycles );
     }
 
     if ( HASH_COUNT( _r.subhead ) )

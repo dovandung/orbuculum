@@ -175,6 +175,8 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                 if ( c == 0b00001000 ) /* Normal ISYNC */
                 {
                     DEBUG( "Normal ISYNC " EOL );
+                    /* The ETM sends I-sync with cycle count instead when it is cycle accurate */
+                    j->cycleAccurate = false;
                     /* Collect either the context or the Info Byte next */
                     j->byteCount = 0;
                     j->contextConstruct = 0;
@@ -194,6 +196,7 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                 if ( c == 0b01110000 ) /* ISYNC with Cycle Count */
                 {
                     DEBUG( "ISYNC+CYCCNT " EOL );
+                    j->cycleAccurate = true;
                     /* Collect the cycle count next */
                     j->byteCount = 0;
                     j->cycleConstruct = 0;
@@ -356,14 +359,15 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                             break;
                         }
 
-                        if ( ( c & 0b11110011 ) == 0b10000010 )
+                        if ( ( c & 0b10110011 ) == 0b10000010 )
                         {
-                            /* Format 2 cycle-accurate P-header */
-                            cpu->eatoms = ( ( c & ( 1 << 2 ) ) != 0 ) + ( ( c & ( 1 << 3 ) ) != 0 );
+                            /* Format 2 cycle-accurate P-header: one W, then two atoms (bit 3 the first, */
+                            /* bit 2 the second, 0 = executed), as in the non cycle-accurate format 2    */
+                            cpu->eatoms = ( ( c & ( 1 << 2 ) ) == 0 ) + ( ( c & ( 1 << 3 ) ) == 0 );
                             cpu->natoms = 2 - cpu->eatoms;
                             cpu->watoms = 1;
                             cpu->instCount += cpu->watoms;
-                            cpu->disposition = ( ( c & ( 1 << 3 ) ) != 0 ) | ( ( c & ( 1 << 2 ) ) != 0 );
+                            cpu->disposition = ( ( c & ( 1 << 3 ) ) == 0 ) | ( ( ( c & ( 1 << 2 ) ) == 0 ) << 1 );
                             _stateChange( cpu, EV_CH_ENATOMS );
                             _stateChange( cpu, EV_CH_WATOMS );
                             retVal = TRACE_EV_MSG_RXED;
@@ -372,12 +376,12 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                             break;
                         }
 
-                        if ( ( c & 0b10100000 ) == 0b10100000 )
+                        if ( ( c & 0b10100011 ) == 0b10100000 )
                         {
-                            /* Format 3 cycle-accurate P-header */
+                            /* Format 3 cycle-accurate P-header: 1 to 8 Ws, then an E atom if bit 6 */
                             cpu->eatoms = ( c & 0x40 ) != 0;
                             cpu->natoms = 0;
-                            cpu->watoms = ( c & 0x1c ) >> 2;
+                            cpu->watoms = ( ( c & 0x1c ) >> 2 ) + 1;
                             cpu->instCount += cpu->watoms;
                             /* Either 1 or 0 eatoms */
                             cpu->disposition = cpu->eatoms;
@@ -389,11 +393,11 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                             break;
                         }
 
-                        if ( ( c & 0b11111011 ) == 0b10010010 )
+                        if ( ( c & 0b10110011 ) == 0b10010010 )
                         {
-                            /* Format 4 cycle-accurate P-header */
-                            cpu->eatoms = ( c & 0x4 ) != 0;
-                            cpu->natoms = ( c & 0x4 ) == 0;
+                            /* Format 4 cycle-accurate P-header: one atom (bit 2, 0 = executed), no W */
+                            cpu->eatoms = ( c & 0x4 ) == 0;
+                            cpu->natoms = ( c & 0x4 ) != 0;
                             cpu->watoms = 0;
 
                             /* Either 1 or 0 eatoms */
@@ -663,7 +667,22 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
                     j->byteCount = j->contextBytes;
                     j->contextConstruct = 0;
+                    j->cycleAccurate = false;
                     newState = j->contextBytes ? TRACE_GET_CONTEXTBYTE : TRACE_GET_INFOBYTE;
+                }
+                else if ( c == 0b01110000 )
+                {
+                    /* I-sync with cycle count: the ETM is in cycle accurate mode */
+                    if ( !j->rxedISYNC )
+                    {
+                        retVal = TRACE_EV_SYNCED;
+                        j->rxedISYNC = true;
+                    }
+
+                    j->byteCount = 0;
+                    j->cycleConstruct = 0;
+                    j->cycleAccurate = true;
+                    newState = TRACE_GET_ICYCLECOUNT;
                 }
 
                 break;

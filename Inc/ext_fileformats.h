@@ -31,6 +31,7 @@ struct execEntryHash
     /* Counter at assembly and source line levels */
     uint64_t count;                      /* Instruction level count */
     uint64_t scount;                     /* Source level count (applied to first instruction of a new source line) */
+    uint64_t cycles;                     /* Cycles spent on this instruction (cycle accurate trace only) */
 
     /* Details about this instruction */
     bool     isJump;                     /* Flag if this is a jump instruction */
@@ -75,6 +76,7 @@ struct subcall
     /* Housekeeping */
     uint64_t myCost;                   /* Inclusive cost of this call */
     uint64_t myVisits;                 /* Inclusive source line visits of this call */
+    uint64_t myCycles;                 /* Inclusive cycles of this call (cycle accurate trace only) */
     uint64_t count;                    /* Number of executions of this call */
     uint64_t inTicks;
 

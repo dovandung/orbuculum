@@ -39,6 +39,26 @@ static const char *_path( const char *prefix, const char *name )
     return p;
 }
 // ====================================================================================================
+static void _costs( FILE *c, bool includeVisits, bool includeCycles, uint64_t inst, uint64_t visits, uint64_t cycles )
+
+/* Finish a cost line with the costs of the events in the profile, in 'events:' order */
+
+{
+    fprintf( c, "%" PRIu64, inst );
+
+    if ( includeVisits )
+    {
+        fprintf( c, " %" PRIu64, visits );
+    }
+
+    if ( includeCycles )
+    {
+        fprintf( c, " %" PRIu64, cycles );
+    }
+
+    fprintf( c, "\n" );
+}
+// ====================================================================================================
 static int _inst_sort_fn( const void *a, const void *b )
 
 /* Sort instructions by address */
@@ -193,21 +213,11 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     {
         return false;
     }
-    fprintf( c, "# callgrind format\n" );
-
-    if ( includeVisits )
-    {
-        fprintf( c, "creator: orbprofile\npositions: instr line\nevent: Inst : CPU Instructions\nevent: Visits : Visits to source line\nevents: Inst Visits\n" );
-    }
-    else
-    {
-        fprintf( c, "creator: orbprofile\npositions: instr line\nevent: Inst : CPU Instructions\nevents: Inst\n" );
-    }
-
     /* The summary is the total of each event. Placeholder records (unknown or interrupt */
     /* positions) aren't executed code, so they are left out here and below.             */
     uint64_t totalInst = 0;
     uint64_t totalVisits = 0;
+    uint64_t totalCycles = 0;
 
     /* A sort elsewhere may have left the head pointers we were given mid-list: find the real heads */
     while ( ( insthead ) && ( insthead->hh.prev ) )
@@ -221,19 +231,30 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         {
             totalInst   += t->count;
             totalVisits += t->scount;
+            totalCycles += t->cycles;
         }
     }
 
-    fprintf( c, "# trace length: %" PRIu64 "\n", timelen );
+    /* Cycles are only known from a cycle accurate trace */
+    bool includeCycles = ( totalCycles != 0 );
+
+    fprintf( c, "# callgrind format\n" );
+    fprintf( c, "creator: orbprofile\npositions: instr line\nevent: Inst : CPU Instructions\n" );
 
     if ( includeVisits )
     {
-        fprintf( c, "summary: %" PRIu64 " %" PRIu64 "\n", totalInst, totalVisits );
+        fprintf( c, "event: Visits : Visits to source line\n" );
     }
-    else
+
+    if ( includeCycles )
     {
-        fprintf( c, "summary: %" PRIu64 "\n", totalInst );
+        fprintf( c, "event: Cycles : CPU Cycles\n" );
     }
+
+    fprintf( c, "events: Inst%s%s\n", includeVisits ? " Visits" : "", includeCycles ? " Cycles" : "" );
+    fprintf( c, "# trace length: %" PRIu64 "\n", timelen );
+    fprintf( c, "summary: " );
+    _costs( c, includeVisits, includeCycles, totalInst, totalVisits, totalCycles );
 
     /* Try to remove frontmatter off the elfile if nessessary and possible */
     if ( deleteMaterial )
@@ -305,14 +326,7 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
             }
         }
 
-        if ( includeVisits )
-        {
-            fprintf( c, "%" PRIu64 " %" PRIu64 "\n", f->count, f->scount );
-        }
-        else
-        {
-            fprintf( c, "%" PRIu64 "\n", f->count );
-        }
+        _costs( c, includeVisits, includeCycles, f->count, f->scount, f->cycles );
 
 
         prevline = n.line;
@@ -352,14 +366,8 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         fprintf( c, "calls=%" PRIu64 " 0x%08x %d\n", s->count, s->sig.dst, s->dsth->line );
 
         /* The cost after calls= is the inclusive cost of those calls */
-        if ( includeVisits )
-        {
-            fprintf( c, "0x%08x %d %" PRIu64 " %" PRIu64 "\n", s->sig.src, s->srch->line, s->myCost, s->myVisits );
-        }
-        else
-        {
-            fprintf( c, "0x%08x %d %" PRIu64 "\n", s->sig.src, s->srch->line, s->myCost );
-        }
+        fprintf( c, "0x%08x %d ", s->sig.src, s->srch->line );
+        _costs( c, includeVisits, includeCycles, s->myCost, s->myVisits, s->myCycles );
 
         s = s->hh.next;
     }
