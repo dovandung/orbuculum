@@ -18,6 +18,27 @@
 // ====================================================================================================
 // ====================================================================================================
 // ====================================================================================================
+static const char *_path( const char *prefix, const char *name )
+
+/* prefix+name with '/' separators: KCachegrind splits object and source paths at '/' only, */
+/* so with Windows '\' it can't find the ELF file for the machine code view                 */
+
+{
+    static char p[1024];
+
+    snprintf( p, sizeof( p ), "%s%s", prefix ? prefix : "", name );
+
+    for ( char *q = p; *q; q++ )
+    {
+        if ( *q == '\\' )
+        {
+            *q = '/';
+        }
+    }
+
+    return p;
+}
+// ====================================================================================================
 static int _inst_sort_fn( const void *a, const void *b )
 
 /* Sort instructions by address */
@@ -231,7 +252,7 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     }
 
     /* ...and record whatever elffilename we ended up with */
-    fprintf( c, "ob=%s\n", e );
+    fprintf( c, "ob=%s\n", _path( NULL, e ) );
 
     HASH_SORT( insthead, _inst_sort_fn );
     struct execEntryHash *f = insthead;
@@ -248,7 +269,7 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
 
         if ( prevfile != n.fileindex )
         {
-            fprintf( c, "fl=(%u) %s%s\n", n.fileindex & HANDLE_MASK, deleteMaterial  ? deleteMaterial : "", SymbolFilename( ss, n.fileindex ) );
+            fprintf( c, "fl=(%u) %s\n", n.fileindex & HANDLE_MASK, _path( deleteMaterial, SymbolFilename( ss, n.fileindex ) ) );
         }
 
         if ( prevfn != n.functionindex )
@@ -315,7 +336,7 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         /* Now publish the call destination. By definition is is known, so can be shortformed */
         if ( prevfile != s->srch->fileindex )
         {
-            fprintf( c, "fl=(%u) %s%s\n", s->srch->fileindex & HANDLE_MASK, deleteMaterial ? deleteMaterial : "", SymbolFilename( ss, s->srch->fileindex ) );
+            fprintf( c, "fl=(%u) %s\n", s->srch->fileindex & HANDLE_MASK, _path( deleteMaterial, SymbolFilename( ss, s->srch->fileindex ) ) );
             prevfile = s->srch->fileindex;
         }
 
@@ -326,9 +347,8 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
         }
 
         /* Same (masked) ids as fl= and fn=, named, since the callee may not have run any code */
-        fprintf( c, "cfl=(%u) %s%s\ncfn=(%u) %s\n",
-                 s->dsth->fileindex & HANDLE_MASK, deleteMaterial ? deleteMaterial : "", SymbolFilename( ss, s->dsth->fileindex ),
-                 s->dsth->functionindex & HANDLE_MASK, SymbolFunction( ss, s->dsth->functionindex ) );
+        fprintf( c, "cfl=(%u) %s\n", s->dsth->fileindex & HANDLE_MASK, _path( deleteMaterial, SymbolFilename( ss, s->dsth->fileindex ) ) );
+        fprintf( c, "cfn=(%u) %s\n", s->dsth->functionindex & HANDLE_MASK, SymbolFunction( ss, s->dsth->functionindex ) );
         fprintf( c, "calls=%" PRIu64 " 0x%08x %d\n", s->count, s->sig.dst, s->dsth->line );
 
         /* The cost after calls= is the inclusive cost of those calls */
