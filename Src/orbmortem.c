@@ -958,6 +958,7 @@ static void _flushBuffer( struct RunTime *r )
 {
     /* Tell the UI there's nothing more to show */
     SIOsetOutputBuffer( r->sio, 0, 0, NULL, false );
+    SIOinfoText( r->sio, NULL );
 
     /* Remove all of the recorded lines */
     while ( r->numLines-- )
@@ -1730,6 +1731,20 @@ static void _windowsSet( struct RunTime *r, int64_t start, int64_t len )
     r->wLines[0] = r->numLines;
 }
 // ====================================================================================================
+static void _showDecoded( struct RunTime *r )
+
+/* Keep the decoded part of the buffer in the status line */
+
+{
+    char t[120];
+    int64_t len = _pmLen( r );
+
+    snprintf( t, sizeof( t ), "Decoded %" PRId64 "-%" PRId64 " of %" PRId64 " KB%s",
+              r->wBound[r->wFirst] / 1024, _windowEnd( r, r->wLast ) / 1024, len / 1024,
+              ( r->wBound[r->wFirst] > 0 ) ? ", Up at the top for more" : ", start of buffer" );
+    SIOinfoText( r->sio, t );
+}
+// ====================================================================================================
 static bool _dumpBuffer( struct RunTime *r )
 
 /* Dump the received data buffer into the text buffer: only the last window of it (-W), so */
@@ -1770,14 +1785,7 @@ static bool _dumpBuffer( struct RunTime *r )
 
     /* Submit this constructed buffer for display */
     SIOsetOutputBuffer( r->sio, r->numLines, r->numLines - 1, &r->opText, false );
-
-    if ( start )
-    {
-        static char winMsg[120];
-        snprintf( winMsg, sizeof( winMsg ), "Decoded the last %" PRId64 " of %" PRId64 " KB (Up/PgUp/Home at the top for more)",
-                  ( len - start ) / 1024, len / 1024 );
-        SIOalert( r->sio, winMsg );
-    }
+    _showDecoded( r );
 
     return true;
 }
@@ -1897,12 +1905,7 @@ static void _windowStep( struct RunTime *r, bool earlier )
     SIOsetOutputBuffer( r->sio, r->numLines, cur, &r->opText, false );
     SIOlinesInserted( r->sio, added - removedFront );
 
-    static char stepMsg[120];
-    int64_t len = _pmLen( r );
-    snprintf( stepMsg, sizeof( stepMsg ), "Showing %" PRId64 "-%" PRId64 " of %" PRId64 " KB (%d window%s)",
-              r->wBound[r->wFirst] / 1024, _windowEnd( r, r->wLast ) / 1024, len / 1024,
-              r->wLast - r->wFirst + 1, ( r->wLast > r->wFirst ) ? "s" : "" );
-    SIOalert( r->sio, stepMsg );
+    _showDecoded( r );
 }
 // ====================================================================================================
 static struct symbolLineStore *_fileAndLine( struct RunTime *r, uint32_t i )

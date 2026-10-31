@@ -98,6 +98,7 @@ struct SIOInstance
     bool outputDebug;                   /* Output debug tagged lines */
     bool isFile;                        /* Indicator that we're reading from a file */
     const char *ttext;                  /* Tagline text (if any) */
+    char *itext;                        /* Info text kept in the status line (if any), under any warning */
 
     const char *progName;
     const char *elffile;
@@ -770,13 +771,15 @@ static void _outputStatus( struct SIOInstance *sio, uint64_t oldintervalBytes )
     mvwprintw( sio->statusWindow, 0, COLS - 4 - ( strlen( sio->progName ) + strlen( genericsBasename( sio->elffile ) ) ),
                " %s:%s ", sio->progName, genericsBasename( sio->elffile ) );
 
-    if ( sio->warnTimeout )
+    if ( ( sio->warnTimeout ) && ( sio->warnTimeout > genericsTimestampmS() ) )
     {
-        if ( sio->warnTimeout > genericsTimestampmS() )
-        {
-            wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_PROBLEM ) );
-            mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->warnText );
-        }
+        wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_PROBLEM ) );
+        mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->warnText );
+    }
+    else if ( sio->itext )
+    {
+        wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_BASELINETEXT ) );
+        mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->itext );
     }
 
     wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_BASELINE ) );
@@ -1125,6 +1128,17 @@ void SIOlinesInserted( struct SIOInstance *sio, int32_t n )
         }
     }
 
+    SIOrequestRefresh( sio );
+}
+// ====================================================================================================
+void SIOinfoText( struct SIOInstance *sio, const char *itext )
+
+/* Set (or with NULL remove) text that stays in the status line; a warning shows over it */
+
+{
+    assert( sio );
+    free( sio->itext );
+    sio->itext = itext ? strdup( itext ) : NULL;
     SIOrequestRefresh( sio );
 }
 // ====================================================================================================
