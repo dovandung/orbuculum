@@ -25,7 +25,7 @@ struct SIOInstance;
 
 /* Events that can be returned by the handler */
 enum SIOEvent { SIO_EV_NONE, SIO_EV_HOLD, SIO_EV_QUIT, SIO_EV_SAVE, SIO_EV_CONSUMED, SIO_EV_SURFACE, SIO_EV_DIVE, SIO_EV_FOPEN,
-                SIO_EV_PREV, SIO_EV_NEXT
+                SIO_EV_PREV, SIO_EV_NEXT, SIO_EV_EARLIER
               };
 
 /* Types of line (each with their own display mechanism & colours */
@@ -47,6 +47,7 @@ int32_t SIOgetCurrentLineno( struct SIOInstance *sio );
 int32_t SIOgetLastLineno( struct SIOInstance *sio );
 void SIOsetCurrentLineno( struct SIOInstance *sio, int32_t l );
 void SIOsetOutputBuffer( struct SIOInstance *sio, int32_t numLines, int32_t currentLine, struct sioline **opTextSet, bool amDiving );
+void SIOlinesInserted( struct SIOInstance *sio, int32_t n );
 void SIOalert( struct SIOInstance *sio, const char *msg );
 void SIOrequestRefresh( struct SIOInstance *sio );
 void SIOheld( struct SIOInstance *sio, bool isHeld );

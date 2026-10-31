@@ -203,6 +203,7 @@ static void _outputHelp( struct SIOInstance *sio )
     wprintw( sio->outputWindow, "       n: Step forwards through execution history of current window" EOL );
     wprintw( sio->outputWindow, EOL "  Use PgUp/PgDown/Home/End and the arrow keys to move around the sample buffer" EOL );
     wprintw( sio->outputWindow, "  Shift-PgUp and Shift-PgDown move more quickly" EOL );
+    wprintw( sio->outputWindow, "  Up, PgUp or Home at the top decodes the trace before it (see -W)" EOL );
     wprintw( sio->outputWindow, EOL "       <?> again to leave this help screen." EOL );
 }
 // ====================================================================================================
@@ -274,6 +275,16 @@ static void _moveCursor( struct SIOInstance *sio, int lines )
             lines -= dir;
         }
     }
+}
+// ====================================================================================================
+static enum SIOEvent _moveUp( struct SIOInstance *sio, int lines )
+
+/* Move the cursor up. If it is already at the top, ask for the trace before it (SIO_EV_EARLIER) */
+
+{
+    int32_t was = sio->opTextRline;
+    _moveCursor( sio, lines );
+    return ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_EARLIER : SIO_EV_CONSUMED;
 }
 // ====================================================================================================
 static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
@@ -384,18 +395,15 @@ static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
             break;
 
         case 259: /* ---------------------------- UP --------------------------------------------- */
-            _moveCursor( sio, -1 );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -1 );
             break;
 
         case 398: /* ---------------------------- Shift PgUp ------------------------------------- */
-            _moveCursor( sio, -( 10 * OUTPUT_WINDOW_L ) );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -( 10 * OUTPUT_WINDOW_L ) );
             break;
 
         case 339: /* ---------------------------- PREV PAGE -------------------------------------- */
-            _moveCursor( sio, -OUTPUT_WINDOW_L );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -OUTPUT_WINDOW_L );
             break;
 
         case 338: /* ---------------------------- NEXT PAGE -------------------------------------- */
@@ -404,11 +412,15 @@ static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
             break;
 
         case 262: /* ---------------------------- HOME ------------------------------------------- */
+        {
+            int32_t was = sio->opTextRline;
             sio->opTextRline = 0;
             _moveCursor( sio, 1 );
             _moveCursor( sio, -1 );
-            op = SIO_EV_CONSUMED;
-            break;
+            /* Already at the top: ask for the trace before it (if the owner has more) */
+            op = ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_EARLIER : SIO_EV_CONSUMED;
+        }
+        break;
 
         case 360: /* ---------------------------- END -------------------------------------------- */
             sio->opTextRline = sio->opTextWline - 1;
@@ -1073,6 +1085,27 @@ void SIOsetOutputBuffer( struct SIOInstance *sio, int32_t numLines, int32_t curr
     }
 
     sio->amDiving    = amDiving;
+    SIOrequestRefresh( sio );
+}
+// ====================================================================================================
+void SIOlinesInserted( struct SIOInstance *sio, int32_t n )
+
+/* n lines were put in front of the output buffer: keep the marks and a search start on the */
+/* same text. The cursor is set with SIOsetOutputBuffer (pass its old line number + n).     */
+
+{
+    sio->oldopTextRline    += n;
+    sio->searchStartPos    += n;
+    sio->pushedopTextRline += n;
+
+    for ( uint32_t t = 0; t < MAX_TAGS; t++ )
+    {
+        if ( sio->tag[t] )
+        {
+            sio->tag[t] += n;
+        }
+    }
+
     SIOrequestRefresh( sio );
 }
 // ====================================================================================================

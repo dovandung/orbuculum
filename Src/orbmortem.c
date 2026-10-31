@@ -37,6 +37,8 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define SCRATCH_STRING_LEN  (65535)     /* Max length for a string under construction */
 //#define DUMP_BLOCK
 #define DEFAULT_PM_BUFLEN_K (32)        /* Default size of the Postmortem buffer */
+#define DEFAULT_WINDOW_K    (256)       /* Default amount of the buffer decoded at a time */
+#define MAX_PM_BUFLEN_K     (2097151)   /* Largest buffer whose length in bytes fits an int */
 #define MAX_TAGS            (10)        /* How many tags we will allow */
 
 /* Hold-at-function (-x): live flow tracking */
@@ -64,6 +66,7 @@ struct Options
     char *odoptions;                    /* Options to pass directly to objdump */
 
     int buflen;                         /* Length of post-mortem buffer, in bytes */
+    int window;                         /* Amount of the buffer decoded at a time, in bytes */
     int tag;                            /* which OFLOW stream are we decoding? */
     int port;                           /* Source information */
     char *server;
@@ -82,7 +85,8 @@ struct Options
     .demangle  = true,
     .traceProt = TRACE_PROT_ETM35,
     .tag       = 2,
-    .buflen    = DEFAULT_PM_BUFLEN_K * 1024
+    .buflen    = DEFAULT_PM_BUFLEN_K * 1024,
+    .window    = DEFAULT_WINDOW_K * 1024
 };
 
 /* A block of received data */
@@ -121,6 +125,7 @@ struct RunTime
     uint8_t *pmBuffer;                  /* The post-mortem buffer */
     int wp;                             /* Index pointers for ring buffer */
     int rp;
+    int64_t winStart;                   /* Offset (from rp) of the oldest decoded byte; 0 = all decoded */
 
     struct sioline *opText;             /* Text of the output buffer */
     int32_t lineNum;                    /* Current line number in output buffer */
@@ -231,6 +236,8 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
     genericsFPrintf( stderr, "    -x, --hold-at:      <function | 0xaddress> Hold as soon as the trace reaches this function" EOL );
     genericsFPrintf( stderr, "                        (or address). Release with H to wait for the next time." EOL );
+    genericsFPrintf( stderr, "    -W, --window:       <Length> Decode this much of the buffer at a time, in KBytes (Default %d KBytes)." EOL, DEFAULT_WINDOW_K );
+    genericsFPrintf( stderr, "                        Up, PgUp or Home at the top of the display decodes the next part back." EOL );
     genericsFPrintf( stderr, "    -V, --version:      Print version and exit" EOL );
     genericsFPrintf( stderr, EOL "(Legacy protocol will connect one port higher than that set in -s)" EOL );
     genericsFPrintf( stderr,     "(This will automatically select the second output stream from orbuculum.)" EOL );
@@ -265,6 +272,7 @@ static struct option _longOptions[] =
     {"verbose", required_argument, NULL, 'v'},
     {"version", no_argument, NULL, 'V'},
     {"hold-at", required_argument, NULL, 'x'},
+    {"window", required_argument, NULL, 'W'},
     {NULL, no_argument, NULL, 0}
 };
 // ====================================================================================================
@@ -275,7 +283,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hVMO:p:P:s:t:v:wx:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hVMO:p:P:s:t:v:wW:x:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -285,8 +293,33 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
             case 'b':
-                r->options->buflen = atoi( optarg ) * 1024;
-                break;
+            {
+                long k = strtol( optarg, NULL, 0 );
+
+                if ( ( k < 1 ) || ( k > MAX_PM_BUFLEN_K ) )
+                {
+                    genericsReport( V_ERROR, "Buffer length must be 1 to %d KBytes" EOL, MAX_PM_BUFLEN_K );
+                    return false;
+                }
+
+                r->options->buflen = ( int )k * 1024;
+            }
+            break;
+
+            // ------------------------------------
+            case 'W':
+            {
+                long k = strtol( optarg, NULL, 0 );
+
+                if ( ( k < 1 ) || ( k > MAX_PM_BUFLEN_K ) )
+                {
+                    genericsReport( V_ERROR, "Window must be 1 to %d KBytes" EOL, MAX_PM_BUFLEN_K );
+                    return false;
+                }
+
+                r->options->window = ( int )k * 1024;
+            }
+            break;
 
             // ------------------------------------
             case 'C':
@@ -1449,9 +1482,87 @@ static void _traceCB( void *d )
 }
 
 // ====================================================================================================
+static int64_t _pmLen( struct RunTime *r )
+
+/* Number of bytes in the post-mortem ring buffer */
+
+{
+    return ( ( int64_t )r->wp + r->options->buflen - r->rp ) % r->options->buflen;
+}
+// ====================================================================================================
+static uint8_t _pmByte( struct RunTime *r, int64_t off )
+
+/* Byte at offset off from the oldest byte in the ring buffer */
+
+{
+    return r->pmBuffer[( r->rp + off ) % r->options->buflen];
+}
+// ====================================================================================================
+static int64_t _syncAtOrBefore( struct RunTime *r, int64_t limit )
+
+/* Offset of the latest A-sync (a run of at least 5 zero bytes then 0x80, both for ETM3.5 and ETM4) */
+/* that starts at or before limit, or -1 if there is none. Decoding can start there.               */
+
+{
+    int64_t len = _pmLen( r );
+    int64_t p = ( limit + 5 < len - 1 ) ? limit + 5 : len - 1;
+
+    for ( ; p >= 5; p-- )
+    {
+        if ( ( _pmByte( r, p ) != 0x80 ) || _pmByte( r, p - 1 ) || _pmByte( r, p - 2 ) ||
+                _pmByte( r, p - 3 ) || _pmByte( r, p - 4 ) || _pmByte( r, p - 5 ) )
+        {
+            continue;
+        }
+
+        /* Start of the zero run */
+        int64_t q = p - 5;
+
+        while ( ( q > 0 ) && ( !_pmByte( r, q - 1 ) ) )
+        {
+            q--;
+        }
+
+        if ( q <= limit )
+        {
+            return q;
+        }
+    }
+
+    return -1;
+}
+// ====================================================================================================
+static void _decodeRange( struct RunTime *r, int64_t from, int64_t to )
+
+/* Decode buffer offsets [from, to) into the output buffer. A range starts at an A-sync (or at */
+/* the start of the buffer), so the decoder and the flow state start afresh.                   */
+
+{
+    TRACEDecoderForceSync( &r->i, false );
+    r->op.currentLine = NO_LINE;
+    r->op.currentFileindex = NO_FILE;
+    r->op.currentFunctionptr = NULL;
+    r->op.workingAddr = NO_DESTADDRESS;
+    r->stackDepth = 0;
+    r->stackDelPending = false;
+
+    int64_t i = ( r->rp + from ) % r->options->buflen;
+    int64_t n = to - from;
+
+    /* Two parts when the range wraps round the end of the ring buffer */
+    while ( n > 0 )
+    {
+        int64_t part = ( n < r->options->buflen - i ) ? n : r->options->buflen - i;
+        TRACEDecoderPump( &r->i, &r->pmBuffer[i], ( int )part, _traceCB, r );
+        n -= part;
+        i = 0;
+    }
+}
+// ====================================================================================================
 static bool _dumpBuffer( struct RunTime *r )
 
-/* Dump received data buffer into text buffer */
+/* Dump the received data buffer into the text buffer: only the last window of it (-W), so */
+/* the display lines (many per buffer byte) stay within memory. _decodeEarlier adds more.  */
 
 {
     _flushBuffer( r );
@@ -1469,25 +1580,90 @@ static bool _dumpBuffer( struct RunTime *r )
         genericsReport( V_DEBUG, "Loaded %s" EOL, r->options->elffile );
     }
 
-    /* Pump the received messages through the TRACE decoder, it will callback to _traceCB with complete sentences */
-    int bytesAvailable = ( ( r->wp + r->options->buflen ) - r->rp ) % r->options->buflen;
+    int64_t len = _pmLen( r );
+    int64_t start = 0;
 
-    /* If we started wrapping (i.e. the rx ring buffer got full) then any guesses about sync status are invalid */
-    if ( ( bytesAvailable == r->options->buflen - 1 ) && ( !r->singleShot ) )
+    /* MTB has no sync points to start decoding at, so it is always decoded whole */
+    if ( ( r->options->traceProt != TRACE_PROT_MTB ) && ( len > r->options->window ) )
     {
-        TRACEDecoderForceSync( &r->i, false );
+        start = _syncAtOrBefore( r, len - r->options->window );
+
+        if ( start < 0 )
+        {
+            start = 0;
+        }
     }
 
-    /* Two calls in case buffer is wrapped - submit both parts */
-    TRACEDecoderPump( &r->i, &r->pmBuffer[r->rp], r->options->buflen - r->rp, _traceCB, r );
-
-    /* The length of this second buffer can be 0 for case buffer is not wrapped */
-    TRACEDecoderPump( &r->i, &r->pmBuffer[0], r->wp, _traceCB, r );
+    r->winStart = start;
+    _decodeRange( r, start, len );
 
     /* Submit this constructed buffer for display */
     SIOsetOutputBuffer( r->sio, r->numLines, r->numLines - 1, &r->opText, false );
 
+    if ( start )
+    {
+        static char winMsg[120];
+        snprintf( winMsg, sizeof( winMsg ), "Decoded the last %" PRId64 " of %" PRId64 " KB (Up/PgUp/Home at the top for more)",
+                  ( len - start ) / 1024, len / 1024 );
+        SIOalert( r->sio, winMsg );
+    }
+
     return true;
+}
+// ====================================================================================================
+static int32_t _decodeEarlier( struct RunTime *r )
+
+/* Decode the window before the decoded part and put its lines in front. Returns the number */
+/* of lines added (0 if the whole buffer is already decoded).                               */
+
+{
+    if ( r->winStart <= 0 )
+    {
+        return 0;
+    }
+
+    int64_t from = ( r->winStart > r->options->window ) ? _syncAtOrBefore( r, r->winStart - r->options->window ) : 0;
+
+    if ( from < 0 )
+    {
+        from = 0;
+    }
+
+    /* Decode into an empty line store, then put the lines we already had after the new ones */
+    struct sioline *had = r->opText;
+    int32_t hadLines = r->numLines;
+
+    /* Decode up to the 0x80 that ends the A-sync the decoded part starts with: the zero run */
+    /* may begin with the last zero byte(s) of a packet, which belong to this earlier part.  */
+    int64_t len = _pmLen( r );
+    int64_t to = r->winStart;
+
+    while ( ( to < len ) && ( !_pmByte( r, to ) ) )
+    {
+        to++;
+    }
+
+    r->opText = NULL;
+    r->numLines = 0;
+    r->opTextAlloc = 0;
+    _decodeRange( r, from, to );
+    int32_t added = r->numLines;
+
+    struct sioline *t = ( struct sioline * )realloc( r->opText, sizeof( struct sioline ) * ( ( size_t )added + hadLines + 1 ) );
+
+    if ( !t )
+    {
+        genericsExit( -1, "Out of memory for display lines, use a smaller -W" EOL );
+    }
+
+    memcpy( &t[added], had, sizeof( struct sioline ) * hadLines );
+    free( had );
+    r->opText = t;
+    r->opTextAlloc = added + hadLines + 1;
+    r->numLines = added + hadLines;
+    r->winStart = from;
+
+    return added;
 }
 // ====================================================================================================
 static struct symbolLineStore *_fileAndLine( struct RunTime *r, uint32_t i )
@@ -2027,6 +2203,29 @@ int main( int argc, char *argv[] )
                             SIObeep();
                         }
 
+                    }
+
+                    break;
+
+                case SIO_EV_EARLIER: // --------------- Cursor at the top: decode the trace before it ---------------------
+                    if ( ( !_r.diving ) && ( _r.numLines ) )
+                    {
+                        int32_t l = SIOgetCurrentLineno( _r.sio );
+                        int32_t added = _decodeEarlier( &_r );
+
+                        if ( added )
+                        {
+                            static char earlyMsg[120];
+                            int64_t len = _pmLen( &_r );
+                            SIOsetOutputBuffer( _r.sio, _r.numLines, l + added, &_r.opText, false );
+                            SIOlinesInserted( _r.sio, added );
+                            snprintf( earlyMsg, sizeof( earlyMsg ), "Decoded %" PRId64 " of %" PRId64 " KB", ( len - _r.winStart ) / 1024, len / 1024 );
+                            SIOalert( _r.sio, earlyMsg );
+                        }
+                        else
+                        {
+                            SIObeep();
+                        }
                     }
 
                     break;
