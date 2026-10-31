@@ -145,6 +145,8 @@ static enum SIOEvent _processSaveFilename( struct SIOInstance *sio )
             op = SIO_EV_CONSUMED;
             break;
 
+        case 8:   /* Backspace as sent by the Windows console and some terminals */
+        case 127:
         case 263: /* --------------------------- Del Remove char from save string ----------------- */
 
             /* Delete last character in save string */
@@ -557,6 +559,8 @@ static enum SIOEvent _processSearchKeys( struct SIOInstance *sio )
             op = SIO_EV_CONSUMED;
             break;
 
+        case 8:   /* Backspace as sent by the Windows console and some terminals */
+        case 127:
         case 263: /* --------------------------- Del Remove char from search string -------------- */
 
             /* Delete last character in search string */
@@ -573,7 +577,7 @@ static enum SIOEvent _processSearchKeys( struct SIOInstance *sio )
         default: /* ---------------------------- Add valid chars to search string ---------------- */
             if ( ( sio->Key > 31 ) && ( sio->Key < 255 ) )
             {
-                sio->searchString = ( char * )realloc( sio->searchString, strlen( sio->searchString ) + 1 );
+                sio->searchString = ( char * )realloc( sio->searchString, strlen( sio->searchString ) + 2 );
                 sio->searchString[strlen( sio->searchString ) + 1] = 0;
                 sio->searchString[strlen( sio->searchString )] = sio->Key;
                 _updateSearch( sio );
@@ -771,7 +775,14 @@ static void _outputStatus( struct SIOInstance *sio, uint64_t oldintervalBytes )
     mvwprintw( sio->statusWindow, 0, COLS - 4 - ( strlen( sio->progName ) + strlen( genericsBasename( sio->elffile ) ) ),
                " %s:%s ", sio->progName, genericsBasename( sio->elffile ) );
 
-    if ( ( sio->warnTimeout ) && ( sio->warnTimeout > genericsTimestampmS() ) )
+    /* While typing a search, filename or mark the prompt uses this line, so nothing else goes under it */
+    bool prompting = ( sio->searchMode ) || ( sio->enteringSaveFilename ) || ( sio->enteringMark );
+
+    if ( prompting )
+    {
+        /* Prompt is drawn below */
+    }
+    else if ( ( sio->warnTimeout ) && ( sio->warnTimeout > genericsTimestampmS() ) )
     {
         wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_PROBLEM ) );
         mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->warnText );
