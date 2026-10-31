@@ -11,6 +11,12 @@
 #include <string.h>
 #include <inttypes.h>
 #if defined(WIN32)
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+    /* wincon.h and ncurses both define KEY_EVENT and MOUSE_MOVED, keep the console one under another name */
+    static const WORD _consoleKeyEvent = KEY_EVENT;
+    #undef KEY_EVENT
+    #undef MOUSE_MOVED
     #include <ncurses/ncurses.h>
 #else
     #include <ncurses.h>
@@ -1170,6 +1176,38 @@ void SIObeep( void )
 }
 
 // ====================================================================================================
+#if defined(WIN32)
+static bool _modifiedKeyWaiting( void )
+
+/* With no wait (timeout 0) the ncurses Windows console code only reports a key that was pressed with no */
+/* Shift, Ctrl or Alt held, so '?', capitals or Ctrl-F only come in with the next plain key. Its path    */
+/* with a timeout handles them, so say when such a key is in the queue.                                 */
+
+{
+    HANDLE h = GetStdHandle( STD_INPUT_HANDLE );
+    INPUT_RECORD ir[32];
+    DWORD n = 0;
+
+    if ( !PeekConsoleInputW( h, ir, sizeof( ir ) / sizeof( ir[0] ), &n ) )
+    {
+        return false;
+    }
+
+    for ( DWORD i = 0; i < n; i++ )
+    {
+        if ( ( ir[i].EventType == _consoleKeyEvent ) && ( ir[i].Event.KeyEvent.bKeyDown ) &&
+                ( ir[i].Event.KeyEvent.uChar.UnicodeChar ) &&
+                ( ir[i].Event.KeyEvent.dwControlKeyState & ( SHIFT_PRESSED | LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED |
+                        LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED ) ) )
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif
+// ====================================================================================================
 
 enum SIOEvent SIOHandler( struct SIOInstance *sio, bool isTick, uint64_t oldintervalBytes, bool supportDebug )
 
@@ -1178,7 +1216,25 @@ enum SIOEvent SIOHandler( struct SIOInstance *sio, bool isTick, uint64_t oldinte
 {
     enum SIOEvent op = SIO_EV_NONE;
 
+#if defined(WIN32)
+    /* The key is already queued, so this 1ms timeout returns at once */
+    bool modified = _modifiedKeyWaiting();
+
+    if ( modified )
+    {
+        wtimeout( sio->statusWindow, 1 );
+    }
+
     sio->Key = wgetch( sio->statusWindow );
+
+    if ( modified )
+    {
+        wtimeout( sio->statusWindow, 0 );
+    }
+
+#else
+    sio->Key = wgetch( sio->statusWindow );
+#endif
 
     if ( sio->Key != ERR )
     {
