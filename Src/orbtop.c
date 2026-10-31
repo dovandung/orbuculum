@@ -28,7 +28,8 @@
 #include "nw.h"
 #include "stream.h"
 
-#define CUTOFF              (10)             /* Default cutoff at 0.1% */
+#define PCT_SCALE           (100000)         /* Percentages in thousandths of a percent */
+#define CUTOFF              (100)            /* Default cutoff at 0.1% (in PCT_SCALE units) */
 #define TOP_UPDATE_INTERVAL (1000)           /* Interval between each on screen update */
 
 #define MAX_EXCEPTIONS      (512)            /* Maximum number of exceptions to be considered */
@@ -97,6 +98,7 @@ struct                                       /* Record for options, either defau
     bool mono;                               /* Supress colour in output */
     int paceDelay;                           /* Delay between blocks of data transmission in file readout */
     uint32_t cutscreen;                      /* Cut screen output after specified number of lines */
+    uint32_t cutoff;                         /* Lowest percentage to report, in PCT_SCALE units */
     uint32_t maxRoutines;                    /* Historic information to emit */
     bool lineDisaggregation;                 /* Aggregate per line or per function? */
     bool demangle;                           /* Do we want to demangle any C++ we come across? */
@@ -114,6 +116,7 @@ struct                                       /* Record for options, either defau
     .logfile = NULL,
     .lineDisaggregation = false,
     .maxRoutines = 8,
+    .cutoff = CUTOFF,
     .demangle = true,
     .displayInterval = TOP_UPDATE_INTERVAL * 1000,
     .port = OFCLIENT_SERVER_PORT,
@@ -643,19 +646,19 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
     {
         for ( uint32_t n = 0; n < reportLines; n++ )
         {
-            percentage = ( report[n].count * 10000 ) / total;
+            percentage = ( report[n].count * PCT_SCALE ) / total;
             samples += report[n].count;
 
             if ( report[n].count )
             {
                 char *d = NULL;
 
-                if ( ( percentage >= CUTOFF ) && ( ( !options.cutscreen ) || ( n < options.cutscreen ) ) )
+                if ( ( percentage >= options.cutoff ) && ( ( !options.cutscreen ) || ( n < options.cutscreen ) ) )
                 {
                     dispSamples += report[n].count;
                     totPercent += percentage;
 
-                    genericsFPrintf( stdout, C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " ", percentage / 100, percentage % 100, report[n].count );
+                    genericsFPrintf( stdout, C_DATA "%3d.%03d%% " C_SUPPORT " %7" PRIu64 " ", percentage / 1000, percentage % 1000, report[n].count );
 
 
                     if ( ( options.reportFilenames ) && ( report[n].n->fileindex != NO_FILE ) )
@@ -676,30 +679,30 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
                 }
 
                 /* Write to current and historical data files if appropriate */
-                if ( percentage >= CUTOFF )
+                if ( percentage >= options.cutoff )
                 {
                     if ( !options.lineDisaggregation )
                     {
                         if ( ( p ) && ( n < options.maxRoutines ) )
                         {
-                            fprintf( p, "%s,%3d.%02d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), percentage / 100, percentage % 100 );
+                            fprintf( p, "%s,%3d.%03d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), percentage / 1000, percentage % 1000 );
                         }
 
                         if ( q )
                         {
-                            fprintf( q, "%s,%3d.%02d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), percentage / 100, percentage % 100 );
+                            fprintf( q, "%s,%3d.%03d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), percentage / 1000, percentage % 1000 );
                         }
                     }
                     else
                     {
                         if ( ( p ) && ( n < options.maxRoutines ) )
                         {
-                            fprintf( p, "%s::%d,%3d.%02d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line, percentage / 100, percentage % 100 );
+                            fprintf( p, "%s::%d,%3d.%03d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line, percentage / 1000, percentage % 1000 );
                         }
 
                         if ( q )
                         {
-                            fprintf( q, "%s::%d,%3d.%02d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line, percentage / 100, percentage % 100 );
+                            fprintf( q, "%s::%d,%3d.%03d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line, percentage / 1000, percentage % 1000 );
                         }
                     }
 
@@ -711,7 +714,7 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
 
     genericsFPrintf( stdout, C_RESET "-----------------" EOL );
 
-    genericsFPrintf( stdout, C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " " C_RESET "of "C_DATA" %" PRIu64 " "C_RESET" Samples" EOL, totPercent / 100, totPercent % 100, dispSamples, samples );
+    genericsFPrintf( stdout, C_DATA "%3d.%03d%% " C_SUPPORT " %7" PRIu64 " " C_RESET "of "C_DATA" %" PRIu64 " "C_RESET" Samples" EOL, totPercent / 1000, totPercent % 1000, dispSamples, samples );
 
     if ( p )
     {
@@ -929,6 +932,7 @@ void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
     genericsFPrintf( stderr, "    -I, --interval:     <interval> Display interval in milliseconds (defaults to %dms)" EOL, TOP_UPDATE_INTERVAL );
     genericsFPrintf( stderr, "    -j, --json-file:    <filename> Output to file in JSON format (or screen if <filename> is '-')" EOL );
+    genericsFPrintf( stderr, "    -k, --cutoff:       <percent> Lowest percentage to report (defaults to 0.1, 0 reports all)" EOL );
     genericsFPrintf( stderr, "    -l, --agg-lines:    Aggregate per line rather than per function" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
@@ -964,6 +968,7 @@ static struct option _longOptions[] =
     {"help", no_argument, NULL, 'h'},
     {"interval", required_argument, NULL, 'I'},
     {"json-file", required_argument, NULL, 'j'},
+    {"cutoff", required_argument, NULL, 'k'},
     {"agg-lines", no_argument, NULL, 'l'},
     {"itm-sync", no_argument, NULL, 'n'},
     {"no-colour", no_argument, NULL, 'M'},
@@ -988,12 +993,23 @@ errcode _processOptions( int argc, char *argv[] )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "c:d:DEe:f:g:hVI:j:lMnO:o:p:P:r:Rs:t:v:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "c:d:DEe:f:g:hVI:j:k:lMnO:o:p:P:r:Rs:t:v:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
             case 'c':
                 options.cutscreen = atoi( optarg );
+                break;
+
+            // ------------------------------------
+            case 'k':
+                if ( atof( optarg ) < 0 )
+                {
+                    genericsReport( V_ERROR, "Cutoff must be 0 or more" EOL );
+                    return ERR;
+                }
+
+                options.cutoff = ( uint32_t )( atof( optarg ) * ( PCT_SCALE / 100 ) + 0.5 );
                 break;
 
             // ------------------------------------
