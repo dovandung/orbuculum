@@ -98,6 +98,7 @@ struct SIOInstance
     bool outputDebug;                   /* Output debug tagged lines */
     bool isFile;                        /* Indicator that we're reading from a file */
     const char *ttext;                  /* Tagline text (if any) */
+    char *itext;                        /* Info text kept in the status line (if any), under any warning */
 
     const char *progName;
     const char *elffile;
@@ -203,6 +204,8 @@ static void _outputHelp( struct SIOInstance *sio )
     wprintw( sio->outputWindow, "       n: Step forwards through execution history of current window" EOL );
     wprintw( sio->outputWindow, EOL "  Use PgUp/PgDown/Home/End and the arrow keys to move around the sample buffer" EOL );
     wprintw( sio->outputWindow, "  Shift-PgUp and Shift-PgDown move more quickly" EOL );
+    wprintw( sio->outputWindow, "  Up, PgUp or Home at the top decodes the trace before it, Down, PgDown or End" EOL );
+    wprintw( sio->outputWindow, "  at the bottom the trace after it (see -W)" EOL );
     wprintw( sio->outputWindow, EOL "       <?> again to leave this help screen." EOL );
 }
 // ====================================================================================================
@@ -274,6 +277,26 @@ static void _moveCursor( struct SIOInstance *sio, int lines )
             lines -= dir;
         }
     }
+}
+// ====================================================================================================
+static enum SIOEvent _moveUp( struct SIOInstance *sio, int lines )
+
+/* Move the cursor up. If it is already at the top, ask for the trace before it (SIO_EV_EARLIER) */
+
+{
+    int32_t was = sio->opTextRline;
+    _moveCursor( sio, lines );
+    return ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_EARLIER : SIO_EV_CONSUMED;
+}
+// ====================================================================================================
+static enum SIOEvent _moveDown( struct SIOInstance *sio, int lines )
+
+/* Move the cursor down. If it is already at the bottom, ask for the trace after it (SIO_EV_LATER) */
+
+{
+    int32_t was = sio->opTextRline;
+    _moveCursor( sio, lines );
+    return ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_LATER : SIO_EV_CONSUMED;
 }
 // ====================================================================================================
 static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
@@ -384,47 +407,49 @@ static enum SIOEvent _processRegularKeys( struct SIOInstance *sio )
             break;
 
         case 259: /* ---------------------------- UP --------------------------------------------- */
-            _moveCursor( sio, -1 );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -1 );
             break;
 
         case 398: /* ---------------------------- Shift PgUp ------------------------------------- */
-            _moveCursor( sio, -( 10 * OUTPUT_WINDOW_L ) );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -( 10 * OUTPUT_WINDOW_L ) );
             break;
 
         case 339: /* ---------------------------- PREV PAGE -------------------------------------- */
-            _moveCursor( sio, -OUTPUT_WINDOW_L );
-            op = SIO_EV_CONSUMED;
+            op = _moveUp( sio, -OUTPUT_WINDOW_L );
             break;
 
         case 338: /* ---------------------------- NEXT PAGE -------------------------------------- */
-            _moveCursor( sio, OUTPUT_WINDOW_L );
-            op = SIO_EV_CONSUMED;
+            op = _moveDown( sio, OUTPUT_WINDOW_L );
             break;
 
         case 262: /* ---------------------------- HOME ------------------------------------------- */
+        {
+            int32_t was = sio->opTextRline;
             sio->opTextRline = 0;
             _moveCursor( sio, 1 );
             _moveCursor( sio, -1 );
-            op = SIO_EV_CONSUMED;
-            break;
+            /* Already at the top: ask for the trace before it (if the owner has more) */
+            op = ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_EARLIER : SIO_EV_CONSUMED;
+        }
+        break;
 
         case 360: /* ---------------------------- END -------------------------------------------- */
+        {
+            int32_t was = sio->opTextRline;
             sio->opTextRline = sio->opTextWline - 1;
             _moveCursor( sio, -1 );
             _moveCursor( sio, 1 );
-            op = SIO_EV_CONSUMED;
-            break;
+            /* Already at the bottom: ask for the trace after it (if the owner has more) */
+            op = ( ( sio->opTextRline == was ) && ( !sio->amDiving ) ) ? SIO_EV_LATER : SIO_EV_CONSUMED;
+        }
+        break;
 
         case 258: /* ---------------------------- DOWN ------------------------------------------- */
-            _moveCursor( sio, 1 );
-            op = SIO_EV_CONSUMED;
+            op = _moveDown( sio, 1 );
             break;
 
         case 396: /* ---------------------------- With shift for added speeeeeed ----------------- */
-            _moveCursor( sio, 10 * OUTPUT_WINDOW_L );
-            op = SIO_EV_CONSUMED;
+            op = _moveDown( sio, 10 * OUTPUT_WINDOW_L );
             break;
 
         default: /* ------------------------------------------------------------------------------ */
@@ -746,13 +771,15 @@ static void _outputStatus( struct SIOInstance *sio, uint64_t oldintervalBytes )
     mvwprintw( sio->statusWindow, 0, COLS - 4 - ( strlen( sio->progName ) + strlen( genericsBasename( sio->elffile ) ) ),
                " %s:%s ", sio->progName, genericsBasename( sio->elffile ) );
 
-    if ( sio->warnTimeout )
+    if ( ( sio->warnTimeout ) && ( sio->warnTimeout > genericsTimestampmS() ) )
     {
-        if ( sio->warnTimeout > genericsTimestampmS() )
-        {
-            wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_PROBLEM ) );
-            mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->warnText );
-        }
+        wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_PROBLEM ) );
+        mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->warnText );
+    }
+    else if ( sio->itext )
+    {
+        wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_BASELINETEXT ) );
+        mvwprintw( sio->statusWindow, 1, 1, " %s ", sio->itext );
     }
 
     wattrset( sio->statusWindow, A_BOLD | COLOR_PAIR( CP_BASELINE ) );
@@ -1073,6 +1100,45 @@ void SIOsetOutputBuffer( struct SIOInstance *sio, int32_t numLines, int32_t curr
     }
 
     sio->amDiving    = amDiving;
+    SIOrequestRefresh( sio );
+}
+// ====================================================================================================
+void SIOlinesInserted( struct SIOInstance *sio, int32_t n )
+
+/* n lines were put in front of the output buffer (n < 0: removed from its front): keep the  */
+/* marks and a search start on the same text, and drop marks whose lines are gone. Call it   */
+/* after SIOsetOutputBuffer, which sets the cursor (pass its old line number + n).           */
+
+{
+    sio->oldopTextRline    += n;
+    sio->searchStartPos    += n;
+    sio->pushedopTextRline += n;
+
+    for ( uint32_t t = 0; t < MAX_TAGS; t++ )
+    {
+        if ( sio->tag[t] )
+        {
+            /* Marks are stored as line number + 1, 0 = no mark */
+            sio->tag[t] += n;
+
+            if ( ( sio->tag[t] < 1 ) || ( sio->tag[t] > sio->opTextWline ) )
+            {
+                sio->tag[t] = 0;
+            }
+        }
+    }
+
+    SIOrequestRefresh( sio );
+}
+// ====================================================================================================
+void SIOinfoText( struct SIOInstance *sio, const char *itext )
+
+/* Set (or with NULL remove) text that stays in the status line; a warning shows over it */
+
+{
+    assert( sio );
+    free( sio->itext );
+    sio->itext = itext ? strdup( itext ) : NULL;
     SIOrequestRefresh( sio );
 }
 // ====================================================================================================
