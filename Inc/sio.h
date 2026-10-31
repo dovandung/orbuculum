@@ -25,7 +25,7 @@ struct SIOInstance;
 
 /* Events that can be returned by the handler */
 enum SIOEvent { SIO_EV_NONE, SIO_EV_HOLD, SIO_EV_QUIT, SIO_EV_SAVE, SIO_EV_CONSUMED, SIO_EV_SURFACE, SIO_EV_DIVE, SIO_EV_FOPEN,
-                SIO_EV_PREV, SIO_EV_NEXT, SIO_EV_EARLIER
+                SIO_EV_PREV, SIO_EV_NEXT, SIO_EV_EARLIER, SIO_EV_LATER
               };
 
 /* Types of line (each with their own display mechanism & colours */

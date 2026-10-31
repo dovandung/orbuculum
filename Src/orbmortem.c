@@ -39,6 +39,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DEFAULT_PM_BUFLEN_K (32)        /* Default size of the Postmortem buffer */
 #define DEFAULT_WINDOW_K    (256)       /* Default amount of the buffer decoded at a time */
 #define MAX_PM_BUFLEN_K     (2097151)   /* Largest buffer whose length in bytes fits an int */
+#define WINDOWS_KEPT_EACH_SIDE (2)      /* Decoded windows kept before and after the cursor's one */
 #define MAX_TAGS            (10)        /* How many tags we will allow */
 
 /* Hold-at-function (-x): live flow tracking */
@@ -125,7 +126,15 @@ struct RunTime
     uint8_t *pmBuffer;                  /* The post-mortem buffer */
     int wp;                             /* Index pointers for ring buffer */
     int rp;
-    int64_t winStart;                   /* Offset (from rp) of the oldest decoded byte; 0 = all decoded */
+    /* The buffer is decoded in windows (-W), each starting at an A-sync. wBound[0..wNum-1] are */
+    /* the window starts (offsets from rp, ascending), wBound[wNum] the end of the buffer. Only */
+    /* windows wFirst..wLast are decoded; wLines[k] is the number of lines of window k.         */
+    int64_t *wBound;
+    int32_t *wLines;
+    int wAlloc;
+    int wNum;
+    int wFirst;
+    int wLast;
 
     struct sioline *opText;             /* Text of the output buffer */
     int32_t lineNum;                    /* Current line number in output buffer */
@@ -963,6 +972,7 @@ static void _flushBuffer( struct RunTime *r )
     r->opText = NULL;
     r->opTextAlloc = 0;
     r->numLines = 0;
+    r->wNum = 0;
 
     /* ...and the file/line references */
     r->op.currentLine = NO_LINE;
@@ -1559,10 +1569,127 @@ static void _decodeRange( struct RunTime *r, int64_t from, int64_t to )
     }
 }
 // ====================================================================================================
+static int64_t _windowEnd( struct RunTime *r, int k )
+
+/* Where decoding window k stops: the end of the buffer for the last window, otherwise the 0x80  */
+/* that ends the A-sync window k + 1 starts with (its zero run may begin with the last zero byte */
+/* or bytes of a packet, which belong to window k).                                             */
+
+{
+    int64_t len = _pmLen( r );
+
+    if ( k >= r->wNum - 1 )
+    {
+        return r->wBound[r->wNum];
+    }
+
+    int64_t to = r->wBound[k + 1];
+
+    while ( ( to < len ) && ( !_pmByte( r, to ) ) )
+    {
+        to++;
+    }
+
+    return to;
+}
+// ====================================================================================================
+static struct sioline *_decodeWindow( struct RunTime *r, int k, int32_t *n )
+
+/* Decode window k into a line array of its own; *n is set to its number of lines */
+
+{
+    struct sioline *keep = r->opText;
+    int32_t keepLines = r->numLines;
+    int32_t keepAlloc = r->opTextAlloc;
+
+    r->opText = NULL;
+    r->numLines = 0;
+    r->opTextAlloc = 0;
+    _decodeRange( r, r->wBound[k], _windowEnd( r, k ) );
+
+    struct sioline *got = r->opText;
+    *n = r->numLines;
+
+    r->opText = keep;
+    r->numLines = keepLines;
+    r->opTextAlloc = keepAlloc;
+    return got;
+}
+// ====================================================================================================
+static void _insertLines( struct RunTime *r, int32_t at, struct sioline *l, int32_t n )
+
+/* Put n lines (from _decodeWindow, freed here) into the output buffer before line at */
+
+{
+    if ( r->numLines + n > r->opTextAlloc )
+    {
+        struct sioline *t = ( struct sioline * )realloc( r->opText, sizeof( struct sioline ) * ( ( size_t )r->numLines + n ) );
+
+        if ( !t )
+        {
+            genericsExit( -1, "Out of memory for display lines, use a smaller -W" EOL );
+        }
+
+        r->opText = t;
+        r->opTextAlloc = r->numLines + n;
+    }
+
+    memmove( &r->opText[at + n], &r->opText[at], sizeof( struct sioline ) * ( r->numLines - at ) );
+
+    if ( n )
+    {
+        memcpy( &r->opText[at], l, sizeof( struct sioline ) * n );
+    }
+
+    r->numLines += n;
+    free( l );
+}
+// ====================================================================================================
+static void _removeLines( struct RunTime *r, int32_t at, int32_t n )
+
+/* Remove n lines from the output buffer, starting at line at */
+
+{
+    for ( int32_t i = at; i < at + n; i++ )
+    {
+        if ( !r->opText[i].isRef )
+        {
+            free( r->opText[i].buffer );
+        }
+    }
+
+    memmove( &r->opText[at], &r->opText[at + n], sizeof( struct sioline ) * ( r->numLines - at - n ) );
+    r->numLines -= n;
+}
+// ====================================================================================================
+static void _windowsSet( struct RunTime *r, int64_t start, int64_t len )
+
+/* One window, [start, len), decoded and holding all lines of the output buffer */
+
+{
+    if ( !r->wBound )
+    {
+        r->wAlloc = 16;
+        r->wBound = ( int64_t * )malloc( sizeof( int64_t ) * ( r->wAlloc + 1 ) );
+        r->wLines = ( int32_t * )malloc( sizeof( int32_t ) * r->wAlloc );
+
+        if ( ( !r->wBound ) || ( !r->wLines ) )
+        {
+            genericsExit( -1, "Out of memory" EOL );
+        }
+    }
+
+    r->wBound[0] = start;
+    r->wBound[1] = len;
+    r->wNum = 1;
+    r->wFirst = r->wLast = 0;
+    r->wLines[0] = r->numLines;
+}
+// ====================================================================================================
 static bool _dumpBuffer( struct RunTime *r )
 
 /* Dump the received data buffer into the text buffer: only the last window of it (-W), so */
-/* the display lines (many per buffer byte) stay within memory. _decodeEarlier adds more.  */
+/* the display lines (many per buffer byte) stay within memory. _windowStep adds more.     */
 
 {
     _flushBuffer( r );
@@ -1594,8 +1721,8 @@ static bool _dumpBuffer( struct RunTime *r )
         }
     }
 
-    r->winStart = start;
     _decodeRange( r, start, len );
+    _windowsSet( r, start, len );
 
     /* Submit this constructed buffer for display */
     SIOsetOutputBuffer( r->sio, r->numLines, r->numLines - 1, &r->opText, false );
@@ -1611,59 +1738,127 @@ static bool _dumpBuffer( struct RunTime *r )
     return true;
 }
 // ====================================================================================================
-static int32_t _decodeEarlier( struct RunTime *r )
+static void _windowStep( struct RunTime *r, bool earlier )
 
-/* Decode the window before the decoded part and put its lines in front. Returns the number */
-/* of lines added (0 if the whole buffer is already decoded).                               */
+/* The cursor is at the top (earlier) or bottom of the decoded part: decode the window before or */
+/* after it, then free the windows more than WINDOWS_KEPT_EACH_SIDE away from the cursor's one.  */
 
 {
-    if ( r->winStart <= 0 )
+    int32_t cur = SIOgetCurrentLineno( r->sio );
+    int32_t added = 0;
+    int k;
+
+    if ( !r->wNum )
     {
-        return 0;
+        SIObeep();
+        return;
     }
 
-    int64_t from = ( r->winStart > r->options->window ) ? _syncAtOrBefore( r, r->winStart - r->options->window ) : 0;
-
-    if ( from < 0 )
+    if ( earlier )
     {
-        from = 0;
+        if ( r->wFirst > 0 )
+        {
+            /* Decoded before and freed again: its bounds are known */
+            k = r->wFirst - 1;
+        }
+        else
+        {
+            /* A new window in front of all the known ones */
+            int64_t b0 = r->wBound[0];
+            int64_t from = ( b0 > r->options->window ) ? _syncAtOrBefore( r, b0 - r->options->window ) : 0;
+
+            if ( from < 0 )
+            {
+                from = 0;
+            }
+
+            if ( from >= b0 )
+            {
+                SIOalert( r->sio, "Start of the buffer" );
+                return;
+            }
+
+            if ( r->wNum + 1 > r->wAlloc )
+            {
+                r->wAlloc *= 2;
+                r->wBound = ( int64_t * )realloc( r->wBound, sizeof( int64_t ) * ( r->wAlloc + 1 ) );
+                r->wLines = ( int32_t * )realloc( r->wLines, sizeof( int32_t ) * r->wAlloc );
+
+                if ( ( !r->wBound ) || ( !r->wLines ) )
+                {
+                    genericsExit( -1, "Out of memory" EOL );
+                }
+            }
+
+            memmove( &r->wBound[1], &r->wBound[0], sizeof( int64_t ) * ( r->wNum + 1 ) );
+            memmove( &r->wLines[1], &r->wLines[0], sizeof( int32_t ) * r->wNum );
+            r->wBound[0] = from;
+            r->wNum++;
+            r->wFirst++;
+            r->wLast++;
+            k = 0;
+        }
+
+        int32_t n;
+        struct sioline *l = _decodeWindow( r, k, &n );
+        _insertLines( r, 0, l, n );
+        r->wLines[k] = n;
+        r->wFirst = k;
+        cur += n;
+        added = n;
+    }
+    else
+    {
+        if ( r->wLast >= r->wNum - 1 )
+        {
+            SIOalert( r->sio, "End of the buffer" );
+            return;
+        }
+
+        int32_t n;
+        k = r->wLast + 1;
+        struct sioline *l = _decodeWindow( r, k, &n );
+        _insertLines( r, r->numLines, l, n );
+        r->wLines[k] = n;
+        r->wLast = k;
     }
 
-    /* Decode into an empty line store, then put the lines we already had after the new ones */
-    struct sioline *had = r->opText;
-    int32_t hadLines = r->numLines;
+    /* The window the cursor is in */
+    int c = r->wFirst;
+    int32_t acc = 0;
 
-    /* Decode up to the 0x80 that ends the A-sync the decoded part starts with: the zero run */
-    /* may begin with the last zero byte(s) of a packet, which belong to this earlier part.  */
+    while ( ( c < r->wLast ) && ( cur >= acc + r->wLines[c] ) )
+    {
+        acc += r->wLines[c];
+        c++;
+    }
+
+    /* Free the windows too far from it */
+    int32_t removedFront = 0;
+
+    while ( r->wFirst < c - WINDOWS_KEPT_EACH_SIDE )
+    {
+        _removeLines( r, 0, r->wLines[r->wFirst] );
+        removedFront += r->wLines[r->wFirst];
+        r->wFirst++;
+    }
+
+    while ( r->wLast > c + WINDOWS_KEPT_EACH_SIDE )
+    {
+        _removeLines( r, r->numLines - r->wLines[r->wLast], r->wLines[r->wLast] );
+        r->wLast--;
+    }
+
+    cur -= removedFront;
+    SIOsetOutputBuffer( r->sio, r->numLines, cur, &r->opText, false );
+    SIOlinesInserted( r->sio, added - removedFront );
+
+    static char stepMsg[120];
     int64_t len = _pmLen( r );
-    int64_t to = r->winStart;
-
-    while ( ( to < len ) && ( !_pmByte( r, to ) ) )
-    {
-        to++;
-    }
-
-    r->opText = NULL;
-    r->numLines = 0;
-    r->opTextAlloc = 0;
-    _decodeRange( r, from, to );
-    int32_t added = r->numLines;
-
-    struct sioline *t = ( struct sioline * )realloc( r->opText, sizeof( struct sioline ) * ( ( size_t )added + hadLines + 1 ) );
-
-    if ( !t )
-    {
-        genericsExit( -1, "Out of memory for display lines, use a smaller -W" EOL );
-    }
-
-    memcpy( &t[added], had, sizeof( struct sioline ) * hadLines );
-    free( had );
-    r->opText = t;
-    r->opTextAlloc = added + hadLines + 1;
-    r->numLines = added + hadLines;
-    r->winStart = from;
-
-    return added;
+    snprintf( stepMsg, sizeof( stepMsg ), "Showing %" PRId64 "-%" PRId64 " of %" PRId64 " KB (%d window%s)",
+              r->wBound[r->wFirst] / 1024, _windowEnd( r, r->wLast ) / 1024, len / 1024,
+              r->wLast - r->wFirst + 1, ( r->wLast > r->wFirst ) ? "s" : "" );
+    SIOalert( r->sio, stepMsg );
 }
 // ====================================================================================================
 static struct symbolLineStore *_fileAndLine( struct RunTime *r, uint32_t i )
@@ -2208,24 +2403,10 @@ int main( int argc, char *argv[] )
                     break;
 
                 case SIO_EV_EARLIER: // --------------- Cursor at the top: decode the trace before it ---------------------
+                case SIO_EV_LATER: // ----------------- Cursor at the bottom: decode the trace after it -------------------
                     if ( ( !_r.diving ) && ( _r.numLines ) )
                     {
-                        int32_t l = SIOgetCurrentLineno( _r.sio );
-                        int32_t added = _decodeEarlier( &_r );
-
-                        if ( added )
-                        {
-                            static char earlyMsg[120];
-                            int64_t len = _pmLen( &_r );
-                            SIOsetOutputBuffer( _r.sio, _r.numLines, l + added, &_r.opText, false );
-                            SIOlinesInserted( _r.sio, added );
-                            snprintf( earlyMsg, sizeof( earlyMsg ), "Decoded %" PRId64 " of %" PRId64 " KB", ( len - _r.winStart ) / 1024, len / 1024 );
-                            SIOalert( _r.sio, earlyMsg );
-                        }
-                        else
-                        {
-                            SIObeep();
-                        }
+                        _windowStep( &_r, s == SIO_EV_EARLIER );
                     }
 
                     break;
