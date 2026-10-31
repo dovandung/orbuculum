@@ -40,6 +40,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 #define DEFAULT_WINDOW_K    (256)       /* Default amount of the buffer decoded at a time */
 #define MAX_PM_BUFLEN_K     (2097151)   /* Largest buffer whose length in bytes fits an int */
 #define WINDOWS_KEPT_EACH_SIDE (2)      /* Decoded windows kept before and after the cursor's one */
+#define ISYNC_SEARCH_BYTES  (65536)     /* How far after an A-sync to look for the first I-sync */
 #define MAX_TAGS            (10)        /* How many tags we will allow */
 
 /* Hold-at-function (-x): live flow tracking */
@@ -1569,28 +1570,71 @@ static void _decodeRange( struct RunTime *r, int64_t from, int64_t to )
     }
 }
 // ====================================================================================================
-static int64_t _windowEnd( struct RunTime *r, int k )
+static void _quietReport( enum verbLevel l, const char *fmt, ... )
 
-/* Where decoding window k stops: the end of the buffer for the last window, otherwise the 0x80  */
-/* that ends the A-sync window k + 1 starts with (its zero run may begin with the last zero byte */
-/* or bytes of a packet, which belong to window k).                                             */
+/* Report sink for the I-sync search decoder: its messages are not wanted */
 
 {
-    int64_t len = _pmLen( r );
+    ( void )l;
+    ( void )fmt;
+}
+// ====================================================================================================
+static void _isyncCB( void *d )
 
+/* The I-sync search decoder reported something: the first report after an A-sync is the I-sync */
+
+{
+    *( bool * )d = true;
+}
+// ====================================================================================================
+static int64_t _isyncEnd( struct RunTime *r, int64_t from )
+
+/* Offset just after the first I-sync following the A-sync at from (or from, if there is none   */
+/* within ISYNC_SEARCH_BYTES). A decoder starting at an A-sync can place instructions only from */
+/* that I-sync on, and on Cortex-M the I-sync can come a good number of bytes after the A-sync. */
+
+{
+    static struct TRACEDecoder sd;
+    static bool sdInit = false;
+
+    if ( !sdInit )
+    {
+        TRACEDecoderInit( &sd, r->options->traceProt, !( r->options->noAltAddr ), _quietReport );
+        sdInit = true;
+    }
+
+    TRACEDecoderForceSync( &sd, false );
+
+    int64_t len = _pmLen( r );
+    bool got = false;
+
+    for ( int64_t o = from; ( o < len ) && ( o < from + ISYNC_SEARCH_BYTES ); o++ )
+    {
+        uint8_t c = _pmByte( r, o );
+        TRACEDecoderPump( &sd, &c, 1, _isyncCB, &got );
+
+        if ( got )
+        {
+            return o + 1;
+        }
+    }
+
+    return from;
+}
+// ====================================================================================================
+static int64_t _windowEnd( struct RunTime *r, int k )
+
+/* Where decoding window k stops: the end of the buffer for the last window, otherwise just after */
+/* the first I-sync of window k + 1. Window k + 1 starts at its A-sync, but its decoder has no    */
+/* address until that I-sync, so the instructions in between are decoded here, by window k.      */
+
+{
     if ( k >= r->wNum - 1 )
     {
         return r->wBound[r->wNum];
     }
 
-    int64_t to = r->wBound[k + 1];
-
-    while ( ( to < len ) && ( !_pmByte( r, to ) ) )
-    {
-        to++;
-    }
-
-    return to;
+    return _isyncEnd( r, r->wBound[k + 1] );
 }
 // ====================================================================================================
 static struct sioline *_decodeWindow( struct RunTime *r, int k, int32_t *n )
