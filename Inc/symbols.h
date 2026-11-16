@@ -46,6 +46,7 @@ struct assyLineEntry
     uint32_t codes;                         /* Binary code for the line */
     bool is4Byte;                           /* Indicate if this is a 4 byte entry */
     bool isJump;                            /* This is a potential jump */
+    bool isCondJump;                        /* This is a conditional jump (B<c>, CBZ, CBNZ) */
     bool isSubCall;                         /* this is a subrouine call (BL/BLX) */
     bool isReturn;                          /* this is a return instruction (i.e. branch to LR or pop into PC) */
     bool etm4branch;                        /* Will this be traced as an endpoint for ETM4 decode? */

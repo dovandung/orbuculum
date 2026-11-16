@@ -32,9 +32,11 @@ struct execEntryHash
     uint64_t count;                      /* Instruction level count */
     uint64_t scount;                     /* Source level count (applied to first instruction of a new source line) */
     uint64_t cycles;                     /* Cycles spent on this instruction (cycle accurate trace only) */
+    uint64_t taken;                      /* Times a conditional jump was taken (rest of count fell through) */
 
     /* Details about this instruction */
     bool     isJump;                     /* Flag if this is a jump instruction */
+    bool     isCondJump;                 /* Flag if this is a conditional jump (B<c>, CBZ, CBNZ) */
     bool     is4Byte;                    /* Flag for 4 byte instruction */
     bool     isSubCall;                  /* Flag for subroutine call (BL/BLX) */
     bool     isReturn;                   /* Flag for return */

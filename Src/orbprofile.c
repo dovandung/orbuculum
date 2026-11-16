@@ -367,6 +367,7 @@ static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
     ( *h )->line          = n.line;
     ( *h )->functionindex = n.functionindex;
     ( *h )->isJump        = n.assy[n.assyLine].isJump;
+    ( *h )->isCondJump    = n.assy[n.assyLine].isCondJump;
     ( *h )->isSubCall     = n.assy[n.assyLine].isSubCall;
     ( *h )->isReturn      = n.assy[n.assyLine].isReturn;
     ( *h )->jumpdest      = n.assy[n.assyLine].jumpdest;
@@ -465,6 +466,12 @@ static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycle
     {
         r->op.h->scount++;
         r->lineVisits++;
+    }
+
+    /* For branch coverage: a conditional jump that executed (condition passed) was taken */
+    if ( ( actioned ) && ( r->op.h->isCondJump ) )
+    {
+        r->op.h->taken++;
     }
 
     /* If this is a computable destination then action it */

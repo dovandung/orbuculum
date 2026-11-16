@@ -331,6 +331,18 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
 
         _costs( c, includeVisits, includeCycles, f->count, f->scount, f->cycles );
 
+        /* Conditional jumps: how often taken out of how often executed, then the jump's own  */
+        /* position (KCacheGrind format 'jcnd=followed/executed target' + source position).    */
+        /* Positions are absolute and the source is this instruction, so the relative         */
+        /* positions of the following cost lines are unaffected.                               */
+        if ( ( f->isCondJump ) && ( f->count ) && ( ( f->jumpdest & SPECIALS_MASK ) != SPECIALS_MASK ) )
+        {
+            struct nameEntry t;
+            int tline = SymbolLookup( ss, f->jumpdest, &t ) ? ( int )t.line : n.line;
+
+            fprintf( c, "jcnd=%" PRIu64 "/%" PRIu64 " 0x%08x %d\n", f->taken, f->count, f->jumpdest, tline );
+            fprintf( c, "0x%08x %d\n", f->addr, n.line );
+        }
 
         prevline = n.line;
         prevaddr = f->addr;

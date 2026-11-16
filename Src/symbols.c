@@ -701,6 +701,7 @@ static enum symbolErr _getTargetProgramInfo( struct SymbolSet *s )
 
                             sourceEntry->assy[sourceEntry->assyLines].lineText           = strdup( line );
                             sourceEntry->assy[sourceEntry->assyLines].isJump             = false;
+                            sourceEntry->assy[sourceEntry->assyLines].isCondJump         = false;
                             sourceEntry->assy[sourceEntry->assyLines].isReturn           = false;
                             sourceEntry->assy[sourceEntry->assyLines].isSubCall          = false;
                             sourceEntry->assy[sourceEntry->assyLines].jumpdest  = NO_DESTADDRESS;
@@ -782,6 +783,18 @@ static enum symbolErr _getTargetProgramInfo( struct SymbolSet *s )
                             )
                             {
                                 sourceEntry->assy[sourceEntry->assyLines].isJump = true;
+
+                                /* Is it conditional, i.e. can it either jump or fall through? (Not AL, UDF or SVC) */
+                                if (
+                                            MASKED_COMPARE( 0xfffff500, 0x0000b100 ) ||                  /* CBNZ/CBZ      */
+                                            ( MASKED_COMPARE( 0xfffff000, 0x0000d000 ) &&
+                                              ( ( ( sourceEntry->assy[sourceEntry->assyLines].codes >> 8 ) & 0xf ) < 0xe ) ) || /* Bc Label (T1) */
+                                            ( MASKED_COMPARE( 0xf800d000, 0xf0008000 ) &&
+                                              ( ( ( sourceEntry->assy[sourceEntry->assyLines].codes >> 22 ) & 0xf ) < 0xe ) )   /* Bc Label (T3) */
+                                )
+                                {
+                                    sourceEntry->assy[sourceEntry->assyLines].isCondJump = true;
+                                }
 
                                 if ( !_getDest( sourceEntry->assy[sourceEntry->assyLines].assy, &sourceEntry->assy[sourceEntry->assyLines].jumpdest ) )
                                 {
