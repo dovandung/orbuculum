@@ -392,3 +392,218 @@ bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, b
     return true;
 }
 // ====================================================================================================
+// ====================================================================================================
+// ====================================================================================================
+// lcov (code coverage) support
+// ====================================================================================================
+// ====================================================================================================
+/* One instruction of the program, with what the trace says about it */
+struct _covInstr
+{
+    uint32_t file;                       /* File index (from symbols.c) */
+    uint32_t line;                       /* Line in that file */
+    uint32_t addr;                       /* Address of the instruction */
+    uint64_t count;                      /* Times executed (0 if never seen in the trace) */
+    uint64_t taken;                      /* For a conditional jump, times it was taken */
+    bool     isCondJump;                 /* Is this a conditional jump? */
+};
+// ====================================================================================================
+static int _cov_sort_fn( const void *a, const void *b )
+
+{
+    const struct _covInstr *x = ( const struct _covInstr * )a;
+    const struct _covInstr *y = ( const struct _covInstr * )b;
+
+    if ( x->file != y->file )
+    {
+        return ( x->file < y->file ) ? -1 : 1;
+    }
+
+    if ( x->line != y->line )
+    {
+        return ( x->line < y->line ) ? -1 : 1;
+    }
+
+    return ( x->addr < y->addr ) ? -1 : ( x->addr > y->addr );
+}
+// ====================================================================================================
+bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss )
+
+/* Output an lcov tracefile (line, function and branch coverage) for genhtml and friends. Every   */
+/* instruction of the program comes from the symbol set, so code that never ran is reported too. */
+
+{
+    struct execEntryHash *h;
+    struct nameEntry n;
+    struct _covInstr *ci = NULL;
+    uint32_t nci = 0;
+    uint32_t cap = 0;
+    FILE *c;
+
+    if ( !lcovfile )
+    {
+        return false;
+    }
+
+    /* A sort elsewhere may have left the head pointer we were given mid-list: find the real head */
+    while ( ( insthead ) && ( insthead->hh.prev ) )
+    {
+        insthead = insthead->hh.prev;
+    }
+
+    /* Collect every instruction of every source line, with its execution data */
+    for ( uint32_t sl = 0; sl < ss->sourceCount; sl++ )
+    {
+        struct sourceLineEntry *src = &ss->sources[sl];
+
+        if ( ( src->fileIdx >= ss->fileCount ) || ( src->lineNo == 0 ) || ( src->lineNo == NO_LINE ) )
+        {
+            continue;
+        }
+
+        for ( uint32_t a = 0; a < src->assyLines; a++ )
+        {
+            if ( nci == cap )
+            {
+                cap = cap ? cap * 2 : 4096;
+                ci = ( struct _covInstr * )realloc( ci, cap * sizeof( struct _covInstr ) );
+
+                if ( !ci )
+                {
+                    return false;
+                }
+            }
+
+            uint32_t addr = src->assy[a].addr;
+            HASH_FIND_INT( insthead, &addr, h );
+
+            ci[nci].file       = src->fileIdx;
+            ci[nci].line       = src->lineNo;
+            ci[nci].addr       = addr;
+            ci[nci].count      = h ? h->count : 0;
+            ci[nci].taken      = h ? h->taken : 0;
+            ci[nci].isCondJump = src->assy[a].isCondJump;
+            nci++;
+        }
+    }
+
+    if ( !nci )
+    {
+        free( ci );
+        return false;
+    }
+
+    qsort( ci, nci, sizeof( struct _covInstr ), _cov_sort_fn );
+
+    c = fopen( lcovfile, "w" );
+
+    if ( !c )
+    {
+        free( ci );
+        return false;
+    }
+
+    uint32_t i = 0;
+
+    while ( i < nci )
+    {
+        uint32_t file = ci[i].file;
+        uint32_t end = i;
+
+        while ( ( end < nci ) && ( ci[end].file == file ) )
+        {
+            end++;
+        }
+
+        fprintf( c, "TN:orbprofile\nSF:%s\n", _path( deleteMaterial, SymbolFilename( ss, file ) ) );
+
+        /* Functions in this file: line of their first instruction, and how often that ran */
+        uint32_t fnf = 0, fnh = 0;
+
+        for ( int pass = 0; pass < 2; pass++ )
+        {
+            for ( uint32_t f = 0; f < ss->functionCount; f++ )
+            {
+                uint32_t addr = ss->functions[f].startAddr;
+
+                if ( ( !SymbolLookup( ss, addr, &n ) ) || ( n.fileindex != file ) || ( n.functionindex != f ) )
+                {
+                    continue;
+                }
+
+                HASH_FIND_INT( insthead, &addr, h );
+
+                if ( !pass )
+                {
+                    fprintf( c, "FN:%u,%s\n", n.line, SymbolFunction( ss, f ) );
+                    fnf++;
+                    fnh += ( h && h->count ) ? 1 : 0;
+                }
+                else
+                {
+                    fprintf( c, "FNDA:%" PRIu64 ",%s\n", h ? h->count : 0, SymbolFunction( ss, f ) );
+                }
+            }
+        }
+
+        fprintf( c, "FNF:%u\nFNH:%u\n", fnf, fnh );
+
+        /* Branches: each conditional jump is a block with two outcomes, jumped and fell through */
+        uint32_t brf = 0, brh = 0, block = 0;
+
+        for ( uint32_t j = i; j < end; j++ )
+        {
+            block = ( ( j > i ) && ( ci[j].line == ci[j - 1].line ) ) ? block : 0;
+
+            if ( ci[j].isCondJump )
+            {
+                if ( ci[j].count )
+                {
+                    fprintf( c, "BRDA:%u,%u,0,%" PRIu64 "\n", ci[j].line, block, ci[j].taken );
+                    fprintf( c, "BRDA:%u,%u,1,%" PRIu64 "\n", ci[j].line, block, ci[j].count - ci[j].taken );
+                    brh += ( ci[j].taken ? 1 : 0 ) + ( ( ci[j].count - ci[j].taken ) ? 1 : 0 );
+                }
+                else
+                {
+                    fprintf( c, "BRDA:%u,%u,0,-\nBRDA:%u,%u,1,-\n", ci[j].line, block, ci[j].line, block );
+                }
+
+                brf += 2;
+                block++;
+            }
+        }
+
+        if ( brf )
+        {
+            fprintf( c, "BRF:%u\nBRH:%u\n", brf, brh );
+        }
+
+        /* Lines: hits are the most any instruction of the line ran */
+        uint32_t lf = 0, lh = 0;
+        uint32_t j = i;
+
+        while ( j < end )
+        {
+            uint32_t line = ci[j].line;
+            uint64_t hits = 0;
+
+            while ( ( j < end ) && ( ci[j].line == line ) )
+            {
+                hits = ( ci[j].count > hits ) ? ci[j].count : hits;
+                j++;
+            }
+
+            fprintf( c, "DA:%u,%" PRIu64 "\n", line, hits );
+            lf++;
+            lh += hits ? 1 : 0;
+        }
+
+        fprintf( c, "LF:%u\nLH:%u\nend_of_record\n", lf, lh );
+        i = end;
+    }
+
+    fclose( c );
+    free( ci );
+    return true;
+}
+// ====================================================================================================

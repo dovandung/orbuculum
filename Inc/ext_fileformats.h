@@ -91,6 +91,7 @@ struct subcall
 bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct SymbolSet *ss );
 bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, bool includeVisits, uint64_t timelen,
                            struct execEntryHash *insthead, struct subcall *subcallList, struct SymbolSet *ss );
+bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss );
 // ====================================================================================================
 
 #ifdef __cplusplus

@@ -1,6 +1,7 @@
 Version 2.3.0 In progress
 * orbprofile: count conditional jumps (B<c>, CBZ, CBNZ) taken vs. fell through, written as KCacheGrind 'jcnd=' lines
-* Add Support/orb2lcov.py to turn orbprofile output into lcov line, function and branch coverage (genhtml, VS Code Coverage Gutters)
+* orbprofile: -c/--coverage-file writes an lcov tracefile with line, function and branch coverage (genhtml, VS Code Coverage Gutters)
+* Add Support/orb2lcov.py to make the same lcov coverage from saved orbprofile KCacheGrind files, and to merge several runs
 * Modify orblcd to receive shorter messages than word-length (if appropriate)
 * Extend from-target timestamping to 1/10th microsecond resolution with rounding
 * Add support for ITM rollover counters in orbtop (if they deliver information, they will be displayed)

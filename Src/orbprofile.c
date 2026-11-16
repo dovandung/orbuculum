@@ -75,6 +75,7 @@ struct Options                           /* Record for options, either defaults 
 
     char *dotfile;                       /* File to output dot information */
     char *profile;                       /* File to output profile information */
+    char *lcovfile;                      /* File to output lcov coverage information */
     int  sampleDuration;                 /* How long we are going to sample for */
     int  bufferMB;                       /* Capture buffer size in MiB */
     bool mono;                           /* Supress colour in output */
@@ -696,6 +697,7 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
     genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Capture buffer size (default %d). Decoding is slower than a fast" EOL, DEFAULT_BUFFER_MB );
     genericsFPrintf( stderr, "                        CPU makes ETM data, so this sets how long a capture can be" EOL );
+    genericsFPrintf( stderr, "    -c, --coverage-file: <Filename> lcov tracefile for line, function and branch coverage" EOL );
     genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time between samples (in ms)" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
@@ -728,6 +730,7 @@ static struct option _longOptions[] =
     {"help", no_argument, NULL, 'h'},
     {"interval", required_argument, NULL, 'I'},
     {"buffer-size", required_argument, NULL, 'b'},
+    {"coverage-file", required_argument, NULL, 'c'},
     {"no-colour", no_argument, NULL, 'M'},
     {"no-color", no_argument, NULL, 'M'},
     {"objdump-opts", required_argument, NULL, 'O'},
@@ -750,7 +753,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:Dd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
@@ -915,6 +918,11 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 break;
 
             // ------------------------------------
+            case 'c':
+                r->options->lcovfile = optarg;
+                break;
+
+            // ------------------------------------
             case '?':
                 if ( optopt == 'b' )
                 {
@@ -964,6 +972,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     genericsReport( V_INFO, "Protocol        : %s" EOL, TRACEDecodeGetProtocolName( r->options->tProtocol ) );
     genericsReport( V_INFO, "Orbflow Tag     : %d" EOL, r->options->tag );
     genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
+    genericsReport( V_INFO, "Coverage file   : %s" EOL, r->options->lcovfile ? r->options->lcovfile : "None" );
     genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
     genericsReport( V_INFO, "Capture buffer  : %d MiB" EOL, r->options->bufferMB );
 
@@ -1313,6 +1322,22 @@ int main( int argc, char *argv[] )
     {
         genericsReport( V_INFO, "Cycle accurate: %" PRIu64 " cycles for %" PRIu64 " instructions (%" PRIu64 " from cycle count packets)" EOL,
                         _r.cyclesExecuted, _r.instExecuted, _r.packetCycles );
+    }
+
+    /* Coverage only needs executed instructions, so it doesn't depend on calls being seen */
+    if ( _r.options->lcovfile )
+    {
+        if ( ( HASH_COUNT( _r.insthead ) ) &&
+                ( ext_ff_outputLcov( _r.options->lcovfile,
+                                     _r.options->truncateDeleteMaterial ? _r.options->deleteMaterial : NULL,
+                                     _r.insthead, _r.s ) ) )
+        {
+            genericsReport( V_INFO, "Output Coverage" EOL );
+        }
+        else
+        {
+            genericsExit( -1, "Failed to output coverage" EOL );
+        }
     }
 
     if ( HASH_COUNT( _r.subhead ) )
