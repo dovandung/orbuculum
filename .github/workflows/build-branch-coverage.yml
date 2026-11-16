@@ -1,0 +1,32 @@
+name: Build branch-coverage (Linux)
+
+# Builds the branch-coverage work on every push to that branch (the other Linux and OSX
+# builds are on request only; Windows builds on every push anyway).
+on:
+  push:
+    branches: [branch-coverage]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libusb-1.0-0-dev libzmq3-dev meson libsdl2-dev libdwarf-dev libdw-dev libelf-dev libcapstone-dev python3-pip python3-pyelftools ninja-build
+      # Ubuntu's Python is externally managed (PEP 668), so pip needs this flag
+      - run: sudo pip3 install --break-system-packages meson==1.2.0
+      - uses: actions/checkout@v4
+      - run: meson setup ./build -Dwerror=false -Dlibdwarf:werror=false
+      - run: ninja -C ./build
+      - name: Check orbprofile has the coverage option
+        run: ./build/orbprofile -h 2>&1 | grep -- '--coverage-file'
+      - name: Check orb2lcov.py
+        run: |
+          python3 -m py_compile Support/orb2lcov.py
+          python3 Support/orb2lcov.py -h
+      - run: meson install -C ./build --destdir ./install
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbuculum-linux-branch-coverage
+          path: build/install/**/*
+          if-no-files-found: error
