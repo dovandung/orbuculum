@@ -22,6 +22,7 @@ import statistics
 import sys
 
 EVENT = re.compile(r'^(,?\s*\{"name":")((?:[^"\\]|\\.)*)(","ph":"X","ts":)(\d+(?:\.\d+)?)(,"dur":)(\d+(?:\.\d+)?)(.*)$', re.S)
+NAMEARG = re.compile(r'^(.*"args":\{"name":")(.*)("\}\}\s*)$', re.S)
 PROCESS = re.compile(r'\(time in (instructions|cycles)\)')
 
 
@@ -123,6 +124,11 @@ with open(a.timeline, "r", encoding="utf-8", errors="replace") as f, open(out, "
             o.write("%s%s%s%.3f%s%.3f%s" % (m.group(1), m.group(2), m.group(3), t0, m.group(5), max(t1 - t0, 0.001), m.group(7)))
         else:
             p = PROCESS.search(line)
+            n = NAMEARG.search(line)
+            if p and n and "\\" in n.group(2):
+                # Older orbprofile wrote a Windows path here unescaped, which is not valid JSON: keep the file name
+                line = n.group(1) + re.split(r'[\\/]', n.group(2))[-1] + n.group(3)
+                p = PROCESS.search(line)
             if p:
                 unit = p.group(1)
                 line = line[:p.start()] + "(real time, from %s)" % a.reference.replace('\\', '\\\\').replace('"', '\\"') + line[p.end():]
