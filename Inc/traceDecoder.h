@@ -160,6 +160,8 @@ struct TRACEDecoderEngine
 {
     bool ( *action )        ( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu, uint8_t c  );
     bool ( *actionPair )    ( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu, uint32_t source, uint32_t dest );
+    void ( *actionBlock )   ( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu, const uint8_t *buf, int len,
+                              void ( *cb )( void *d ), void *d ); /* Optional: action for a whole buffer, calling cb as needed */
     void ( *destroy )       ( struct TRACEDecoderEngine *e );
     bool ( *synced )        ( struct TRACEDecoderEngine *e );
     void ( *forceSync )     ( struct TRACEDecoderEngine *e, bool isSynced );

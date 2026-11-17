@@ -111,11 +111,21 @@ void TRACEDecoderPump( struct TRACEDecoder *i, uint8_t *buf, int len, traceDecod
 
     /* len can arrive as 0 for the case of an unwrapped buffer */
 
-    if ( i->engine->action )
+    if ( i->engine->actionBlock )
     {
-        while ( len-- )
+        i->engine->actionBlock( i->engine, &i->cpu, buf, len, cb, d );
+    }
+    else if ( i->engine->action )
+    {
+        /* Hot loop: keep the function pointer and its arguments in registers */
+        bool ( *const action )( struct TRACEDecoderEngine *, struct TRACECPUState *, uint8_t ) = i->engine->action;
+        struct TRACEDecoderEngine *const e = i->engine;
+        struct TRACECPUState *const cpu = &i->cpu;
+        const uint8_t *const end = buf + len;
+
+        while ( buf < end )
         {
-            if ( i->engine->action(  i->engine, &i->cpu, *( buf++ ) ) )
+            if ( action( e, cpu, *( buf++ ) ) )
             {
                 /* Something worthy of being reported happened */
                 cb( d );
@@ -153,7 +163,9 @@ void TRACEDecoderInit( struct TRACEDecoder *i, enum TRACEprotocol protocol, bool
     TRACEDecoderZeroStats( i );
     i->cpu.addr = ADDRESS_UNKNOWN;
     i->cpu.cycleCount = COUNT_UNKNOWN;
-    i->cpu.report = report;
+    /* The decoders report at debug level only, and build the text for every byte they are given. */
+    /* When that would be thrown away (the standard reporter, below debug level) don't call it.   */
+    i->cpu.report = ( ( report == genericsReport ) && ( genericsGetReportLevel() < V_DEBUG ) ) ? NULL : report;
     i->protocol = protocol;
 
     i->engine = _engine[ protocol ]();

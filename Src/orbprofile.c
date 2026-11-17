@@ -59,6 +59,7 @@ static uint64_t _lostInstructions;
 struct _subcallAccount
 {
     struct subcallSig sig;
+    struct subcall *rec;                 /* The record for this source/destination pair */
     uint64_t inTicks;                    /* Instructions executed when the call was made */
     uint64_t inVisits;                   /* Source line visits when the call was made */
     uint64_t inCycles;                   /* Cycles when the call was made */
@@ -114,6 +115,7 @@ struct opConstruct
     struct execEntryHash *oldh;          /* The exec entry we're currently in (file, function, line, addr etc) */
     struct execEntryHash *inth;          /* Fake exec entry for an interrupt source */
     uint32_t workingAddr;                /* The address we're currently in */
+    struct execEntryHash **link;         /* Where the record of the instruction at workingAddr is, or will be, noted */
     uint32_t nextAddr;                   /* The address we will next be accessing (if known) */
     uint32_t lastfn;                     /* The function of the last instruction carried out */
 
@@ -156,6 +158,7 @@ struct RunTime
     /* Subroutine related info...the call stack and its length */
     struct _subcallAccount *substack;           /* Calls stack data */
     uint32_t substacklen;                       /* Calls stack length */
+    uint32_t substackcap;                       /* Calls stack entries allocated */
 
     /* Stats about the run */
     int instCount;                              /* Number of instruction locations */
@@ -211,6 +214,16 @@ struct RunTime
 // Internally available routines
 // ====================================================================================================
 // ====================================================================================================
+// ====================================================================================================
+/* TRACEStateChanged, inline: this is asked several times for every trace message */
+static inline bool _changed( struct TRACECPUState *cpu, enum TRACEchanges c )
+
+{
+    const uint32_t m = 1u << c;
+    const bool r = ( cpu->changeRecord & m ) != 0;
+    cpu->changeRecord &= ~m;
+    return r;
+}
 // ====================================================================================================
 static uint64_t _timelineNow( struct RunTime *r )
 
@@ -281,9 +294,10 @@ static void _timelineCloseOpenCalls( struct RunTime *r )
     }
 }
 // ====================================================================================================
-static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
+static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to, struct execEntryHash *from )
 
-/* This is a call or a return, manipulate stack tracking appropriately */
+/* This is a call or a return, manipulate stack tracking appropriately. from is the calling */
+/* instruction if there is one: it remembers the record of the call it made last time.       */
 
 {
     struct subcall *s;
@@ -296,7 +310,13 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     }
 
     /* ...add it to the call stack */
-    r->substack = ( struct _subcallAccount * )realloc( r->substack, ( r->substacklen + 1 ) * sizeof( struct _subcallAccount ) );
+    if ( r->substacklen >= r->substackcap )
+    {
+        r->substackcap = r->substackcap ? r->substackcap * 2 : 64;
+        r->substack = ( struct _subcallAccount * )realloc( r->substack, r->substackcap * sizeof( struct _subcallAccount ) );
+        MEMCHECKV( r->substack );
+    }
+
 
     /* This is a call */
     r->substack[r->substacklen].sig.src     = retAddr;
@@ -306,7 +326,14 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     r->substack[r->substacklen].inCycles    = r->cyclesExecuted;
 
     /* Find a record for this source/dest pair */
-    HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
+    if ( ( from ) && ( from->callRec ) && ( from->callDst == to ) )
+    {
+        s = from->callRec;
+    }
+    else
+    {
+        HASH_FIND( hh, r->subhead, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ), s );
+    }
 
     if ( !s )
     {
@@ -317,6 +344,13 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
         HASH_ADD( hh, r->subhead, sig, sizeof( struct subcallSig ), s );
     }
 
+    if ( from )
+    {
+        from->callRec = s;
+        from->callDst = to;
+    }
+
+    r->substack[r->substacklen].rec = s;
     r->substacklen++;
 
 #ifdef ORBPROFILE_DEBUG
@@ -373,9 +407,12 @@ static uint32_t _returnEvent( struct RunTime *r, uint32_t to, bool mustMatch )
 #endif
 
         DBG_OUT( " DEC:%3d %08x (wanted %08x)" EOL, r->substacklen + 1, a->sig.src, to );
-        HASH_FIND( hh, r->subhead, &a->sig, sizeof( struct subcallSig ), s );
-        assert( s );
-        _timelineCall( r, a );
+        s = a->rec;
+
+        if ( r->timeline )
+        {
+            _timelineCall( r, a );
+        }
 
         /* Inclusive costs: what was executed and visited while this call was open */
         s->myCost   += r->instExecuted - a->inTicks;
@@ -468,6 +505,7 @@ static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
     ( *h )->is4Byte       = n.assy[n.assyLine].is4Byte;
     ( *h )->codes         = n.assy[n.assyLine].codes;
     ( *h )->assyText      = n.assy[n.assyLine].lineText;
+    ( *h )->special       = ( *h )->isJump || ( *h )->isCondJump || ( *h )->isSubCall || ( *h )->isReturn;
 
     HASH_ADD_INT( r->insthead, addr, ( *h ) );
     r->icacheAddr[ci]  = addr;
@@ -536,13 +574,23 @@ static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycle
 
     r->op.oldh = r->op.h;
 
-    if ( !_hashFindOrCreate( r, r->op.workingAddr, &r->op.h ) )
+    /* The instruction before this one usually knows which record comes next */
+    if ( ( r->op.link ) && ( *r->op.link ) && ( ( *r->op.link )->addr == r->op.workingAddr ) )
+    {
+        r->op.h = *r->op.link;
+    }
+    else if ( !_hashFindOrCreate( r, r->op.workingAddr, &r->op.h ) )
     {
         /* Position unknown: count it as lost and wait for the next address from the trace. */
         /* The interrupt placeholder record has no jump/call/return flags, so it is inert.  */
         _lostInstructions++;
         r->op.h = r->op.inth;
+        r->op.link = NULL;
         return;
+    }
+    else if ( r->op.link )
+    {
+        *r->op.link = r->op.h;
     }
 
     //    if ( r->op.oldh ) DBG_OUT( "%4d,%4d %4d %s%s%c %s", r->op.h->functionindex, ( r->op.h ? r->op.oldh->functionindex : 0 ),  r->op.h->fileindex,
@@ -573,11 +621,15 @@ static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycle
     {
         /* Take this call ... note that the jumpdest may not be known at this point */
         r->op.workingAddr = r->op.h->jumpdest;
+        r->op.link = &r->op.h->jumpH;
     }
     else
     {
         /* If it wasn't a jump or subroutine then increment the address */
         r->op.workingAddr += ( r->op.h->is4Byte ) ? 4 : 2;
+
+        /* A return or other indirect branch goes where the trace says: remember the last place */
+        r->op.link = ( ( actioned ) && ( r->op.h->isReturn ) ) ? &r->op.h->jumpH : &r->op.h->seqH;
     }
 }
 
@@ -599,11 +651,72 @@ static uint32_t _checkJumps( struct RunTime *r, bool actioned )
 
         if ( r->op.h->isSubCall )
         {
-            _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), r->op.workingAddr );
+            _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), r->op.workingAddr, r->op.h );
         }
     }
 
     return popped;
+}
+// ====================================================================================================
+static void _runAtoms( struct RunTime *r, uint32_t n, uint32_t disposition )
+
+/* Account n atoms (ETM3.5: one instruction each) when the trace is not cycle accurate. Most    */
+/* instructions are neither a jump, a call nor a return, and for those all there is to do is   */
+/* count them and step on: that is done here with the state in local variables. The others,    */
+/* and any instruction whose record is not at hand yet, go through the general routines.       */
+
+{
+    struct execEntryHash *h = r->op.h;
+    struct execEntryHash **link = r->op.link;
+    uint32_t addr = r->op.workingAddr;
+    uint64_t inst = 0;
+    uint64_t visits = 0;
+
+    while ( n )
+    {
+        struct execEntryHash *nh = link ? *link : NULL;
+
+        if ( ( !nh ) || ( nh->addr != addr ) || ( nh->special ) )
+        {
+            /* The general way, with the shared state brought up to date for it and read back after */
+            r->instExecuted += inst;
+            r->lineVisits += visits;
+            inst = visits = 0;
+            r->op.workingAddr = addr;
+            r->op.link = link;
+            r->op.h = h;
+            _handleInstruction( r, disposition & 1, 0 );
+            _checkJumps( r, disposition & 1 );
+            h = r->op.h;
+            link = r->op.link;
+            addr = r->op.workingAddr;
+        }
+        else
+        {
+            nh->count++;
+            inst++;
+
+            if ( ( h ) && ( ( nh->line != h->line ) || ( nh->functionindex != h->functionindex ) ) )
+            {
+                nh->scount++;
+                visits++;
+            }
+
+            addr += nh->is4Byte ? 4 : 2;
+            link = &nh->seqH;
+            r->op.oldh = h;
+            h = nh;
+        }
+
+        disposition >>= 1;
+        n--;
+    }
+
+    r->instExecuted += inst;
+    r->lineVisits += visits;
+    r->op.workingAddr = addr;
+    r->op.link = link;
+    r->op.h = h;
 }
 // ====================================================================================================
 static uint32_t _atomCycles( struct RunTime *r, uint32_t *budget )
@@ -628,6 +741,13 @@ static bool _etm4Known( struct RunTime *r, struct execEntryHash **h )
 /* ETM4: is the current position known, and if so its record */
 
 {
+    /* The instruction before usually knows which record comes next */
+    if ( ( r->op.link ) && ( *r->op.link ) && ( ( *r->op.link )->addr == r->op.workingAddr ) )
+    {
+        *h = *r->op.link;
+        return true;
+    }
+
     return ( ( r->op.workingAddr & SPECIALS_MASK ) != SPECIALS_MASK ) && _hashFindOrCreate( r, r->op.workingAddr, h );
 }
 // ====================================================================================================
@@ -654,7 +774,7 @@ static uint32_t _etm4Resolve( struct RunTime *r, uint32_t dest )
     }
     else if ( ( r->op.h ) && ( r->op.h->isSubCall ) && ( ( dest & SPECIALS_MASK ) != SPECIALS_MASK ) )
     {
-        _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), dest );
+        _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), dest, r->op.h );
     }
 
     return popped;
@@ -754,14 +874,14 @@ static void _etm4CB( struct RunTime *r, struct TRACECPUState *cpu )
 /* to a branch, and addresses come after the branch they belong to, so nothing is deferred.       */
 
 {
-    if ( TRACEStateChanged( &r->i, EV_CH_EXRETURN ) )
+    if ( _changed( cpu, EV_CH_EXRETURN ) )
     {
         r->op.etm4ExReturn = true;
     }
 
-    if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
+    if ( _changed( cpu, EV_CH_ADDRESS ) )
     {
-        if ( TRACEStateChanged( &r->i, EV_CH_EX_ENTRY ) )
+        if ( _changed( cpu, EV_CH_EX_ENTRY ) )
         {
             /* Exception packet: this is the address it returns to */
             DBG_OUT( "EXCEPTION, returns to %08x" EOL, cpu->addr );
@@ -772,7 +892,7 @@ static void _etm4CB( struct RunTime *r, struct TRACECPUState *cpu )
             /* Start of the exception handler: a call from where it returns to */
             DBG_OUT( "HANDLER %08x" EOL, cpu->addr );
             r->op.etm4ExPending = false;
-            _callEvent( r, r->op.etm4ExRetAddr, cpu->addr );
+            _callEvent( r, r->op.etm4ExRetAddr, cpu->addr, NULL );
             r->op.workingAddr = cpu->addr;
         }
         else
@@ -798,7 +918,7 @@ static void _etm4CB( struct RunTime *r, struct TRACECPUState *cpu )
         r->op.etm4ExReturn = false;
     }
 
-    if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
+    if ( _changed( cpu, EV_CH_ENATOMS ) )
     {
         uint32_t n = cpu->eatoms + cpu->natoms;
         uint32_t disposition = cpu->disposition;
@@ -819,7 +939,7 @@ static void _traceCB( void *d )
 
 {
     struct RunTime *r       = ( struct RunTime * )d;
-    struct TRACECPUState *cpu = TRACECPUState( &r->i );
+    struct TRACECPUState *cpu = &r->i.cpu;
     static uint32_t incAddr        = 0;
     static uint32_t disposition    = 0;
     static uint32_t deferredCycles = 0;
@@ -834,7 +954,7 @@ static void _traceCB( void *d )
         /* Fill in a time to start from */
         r->starttime = genericsTimestampmS();
 
-        if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
+        if ( _changed( cpu, EV_CH_ADDRESS ) )
         {
             r->op.workingAddr = cpu->addr;
             DBG_OUT( "Got initial address %08x" EOL, r->op.workingAddr );
@@ -860,7 +980,7 @@ static void _traceCB( void *d )
     /* Pull changes introduced by this event ============================== */
 
     /* Cycle count packets (cycle accurate trace) report cycles not covered by P-headers */
-    if ( ( TRACEStateChanged( &r->i, EV_CH_CYCLECOUNT ) ) && ( r->sampling ) )
+    if ( ( _changed( cpu, EV_CH_CYCLECOUNT ) ) && ( r->sampling ) )
     {
         r->pendingCycles += cpu->cycleCount;
         r->packetCycles  += cpu->cycleCount;
@@ -876,9 +996,9 @@ static void _traceCB( void *d )
         return;
     }
 
-    if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
+    if ( _changed( cpu, EV_CH_ENATOMS ) )
     {
-        if ( TRACEStateChanged( &r->i, EV_CH_WATOMS ) )
+        if ( _changed( cpu, EV_CH_WATOMS ) )
         {
             /* Cycle accurate: watoms cycles for these atoms. Waits beyond one per atom come  */
             /* first (format 3), and belong to the next instruction to complete. If there are */
@@ -897,9 +1017,9 @@ static void _traceCB( void *d )
         }
 
         /* Reading a change clears it, so collect what came with these atoms once */
-        bool newAddr = TRACEStateChanged( &r->i, EV_CH_ADDRESS );
-        bool exEntry = TRACEStateChanged( &r->i, EV_CH_EX_ENTRY );
-        bool exExit  = TRACEStateChanged( &r->i, EV_CH_EX_EXIT );
+        bool newAddr = _changed( cpu, EV_CH_ADDRESS );
+        bool exEntry = _changed( cpu, EV_CH_EX_ENTRY );
+        bool exExit  = _changed( cpu, EV_CH_EX_EXIT );
         uint32_t popped = 0;
 
         /* An exception is taken when the new address is the start of a handler. A branch with */
@@ -908,7 +1028,7 @@ static void _traceCB( void *d )
 
         /* We are going to execute some instructions. Check if the last of the old batch of    */
         /* instructions was cancelled and, if it wasn't and it's still outstanding, action it. */
-        if ( TRACEStateChanged( &r->i, EV_CH_CANCELLED ) )
+        if ( _changed( cpu, EV_CH_CANCELLED ) )
         {
             /* Its cycles go to the next instruction that completes */
             DBG_OUT( "CANCELLED" EOL );
@@ -943,7 +1063,7 @@ static void _traceCB( void *d )
                 /* The exception is a call from where the interrupted code resumes. After a return */
                 /* the trace gave no destination for (tail-chaining), that is where it returned to. */
                 DBG_OUT( "INTERRUPT!!" EOL );
-                _callEvent( r, ( ( ( r->op.workingAddr & SPECIALS_MASK ) == SPECIALS_MASK ) && ( popped ) ) ? popped : r->op.workingAddr, cpu->addr );
+                _callEvent( r, ( ( ( r->op.workingAddr & SPECIALS_MASK ) == SPECIALS_MASK ) && ( popped ) ) ? popped : r->op.workingAddr, cpu->addr, NULL );
             }
             else if ( ( ( exEntry ) || ( exExit ) ) && ( !popped ) )
             {
@@ -963,6 +1083,14 @@ static void _traceCB( void *d )
         DBG_OUT( "E:%d N:%d" EOL, cpu->eatoms, cpu->natoms );
 
         /* Action those changes, except the last one */
+        if ( ( !cycleBudget ) && ( !r->pendingCycles ) && ( incAddr > 1 ) )
+        {
+            /* Not cycle accurate (the usual case): the quick way */
+            _runAtoms( r, incAddr - 1, disposition );
+            disposition >>= ( incAddr - 1 );
+            incAddr = 1;
+        }
+
         while ( incAddr > 1 )
         {
             incAddr--;

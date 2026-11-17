@@ -850,6 +850,94 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 }
 
 // ====================================================================================================
+static void _pumpActionBlock( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu, const uint8_t *buf, int len,
+                              void ( *cb )( void *d ), void *d )
+
+/* Pump a buffer into the protocol decoder, calling cb for everything worth reporting. The bytes */
+/* that make up nearly all of an instruction trace are handled here, with the same result as     */
+/* _pumpAction gives: format 1 P-headers while idle, and Thumb branch addresses in the alternate */
+/* encoding. Everything else (and everything when debug reporting is on) goes to _pumpAction.    */
+
+{
+    struct ETM35DecodeState *j = ( struct ETM35DecodeState * )e;
+    const uint8_t *const end = buf + len;
+    const bool fast = ( !cpu->report );
+
+    while ( buf < end )
+    {
+        const uint8_t c = *buf++;
+
+        /* 0x80 can be the end of an A-sync, so that is left to the general code */
+        if ( ( fast ) && ( c != 0x80 ) )
+        {
+            if ( j->p == TRACE_IDLE )
+            {
+                if ( ( ( c & 0b10000011 ) == 0b10000000 ) && ( !j->cycleAccurate ) )
+                {
+                    /* Format 1 P-header: up to 15 executed atoms and an optional not-executed one */
+                    j->asyncCount = 0;
+                    cpu->eatoms = ( c & 0x3C ) >> 2;
+                    cpu->natoms = ( c >> 6 ) & 1;
+                    cpu->instCount += cpu->eatoms + cpu->natoms;
+                    cpu->disposition = ( 1 << cpu->eatoms ) - 1;
+                    cpu->changeRecord |= ( 1 << EV_CH_ENATOMS );
+
+                    if ( j->rxedISYNC )
+                    {
+                        cb( d );
+                    }
+
+                    continue;
+                }
+
+                if ( ( ( c & 0x81 ) == 0x81 ) && ( j->usingAltAddrEncode ) && ( cpu->addrMode == TRACE_ADDRMODE_THUMB ) )
+                {
+                    /* First byte of a branch address that carries on */
+                    j->asyncCount = 0;
+                    j->addrConstruct = ( j->addrConstruct & ~( 0b01111111 ) ) | ( c & 0b01111110 );
+                    j->byteCount = 1;
+                    cpu->changeRecord |= ( 1 << EV_CH_ADDRESS );
+                    j->p = TRACE_COLLECT_BA_ALT_FORMAT;
+                    continue;
+                }
+            }
+            else if ( ( j->p == TRACE_COLLECT_BA_ALT_FORMAT ) && ( cpu->addrMode == TRACE_ADDRMODE_THUMB ) && ( c ) )
+            {
+                if ( ( c & 0x80 ) && ( j->byteCount < 4 ) )
+                {
+                    /* Seven more address bits, and more to come */
+                    j->asyncCount = 0;
+                    j->addrConstruct = ( j->addrConstruct & ~( 0x7fu << ( 7 * j->byteCount ) ) ) | ( ( uint32_t )( c & 0x7f ) << ( 7 * j->byteCount ) );
+                    j->byteCount++;
+                    continue;
+                }
+
+                if ( !( c & 0xC0 ) )
+                {
+                    /* Last byte, with no exception information after it */
+                    j->asyncCount = 0;
+                    j->addrConstruct = ( j->addrConstruct & ~( 0x3fu << ( 7 * j->byteCount ) ) ) | ( ( uint32_t )( c & 0x3f ) << ( 7 * j->byteCount ) );
+                    j->byteCount++;
+                    cpu->addr = j->addrConstruct;
+                    j->p = TRACE_IDLE;
+
+                    if ( j->rxedISYNC )
+                    {
+                        cb( d );
+                    }
+
+                    continue;
+                }
+            }
+        }
+
+        if ( _pumpAction( e, cpu, c ) )
+        {
+            cb( d );
+        }
+    }
+}
+// ====================================================================================================
 
 static void _pumpDestroy( struct TRACEDecoderEngine *e )
 
@@ -903,6 +991,7 @@ struct TRACEDecoderEngine *ETM35DecoderPumpCreate( void )
 
     struct TRACEDecoderEngine *e = ( struct TRACEDecoderEngine * )calloc( 1, sizeof( struct ETM35DecodeState ) );
     e->action        = _pumpAction;
+    e->actionBlock   = _pumpActionBlock;
     e->destroy       = _pumpDestroy;
     e->synced        = _synced;
     e->forceSync     = _forceSync;

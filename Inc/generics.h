@@ -99,6 +99,7 @@ char *genericsUnescape( char *str );
 uint64_t genericsTimestampuS( void );
 uint32_t genericsTimestampmS( void );
 bool genericsSetReportLevel( enum verbLevel lset );
+enum verbLevel genericsGetReportLevel( void );
 void genericsFPrintf( FILE *stream, const char *fmt, ... );
 char *genericsGetBaseDirectory( void );
 const char *genericsBasename( const char *n );

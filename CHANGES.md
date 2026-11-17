@@ -1,4 +1,5 @@
 Version 2.3.0 In progress
+* orbprofile: decoding about twice as fast (ETM3.5 decoder fast paths for P-headers and branch addresses, no debug text built unless asked for, instruction records linked to their successors, tight loop for plain instructions). Output unchanged.
 * New tool orbdata: logs the values written to (or read from) up to four variables from DWT data trace, to CSV; --setup prints the comparator setup for gdb, Keil, IAR or C. gdb command dwtWatch, Support/orbdata_plot.py
 * orbprofile: function timeline (-g <file>, -G <min length>): every call and exception as Chrome trace JSON, for ui.perfetto.dev or chrome://tracing
 * orbprofile: live mode (-l <ms>): runs until CTRL-C, rewrites the coverage file and reports lines/functions/branches covered at every interval; -I 0 captures until CTRL-C
