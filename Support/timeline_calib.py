@@ -10,6 +10,7 @@ stretch is scaled on its own, so parts of the program that execute fewer instruc
 
   python timeline_calib.py timeline.json -r SysTick_Handler -p 1ms
   python timeline_calib.py timeline.json -r TIM2_IRQHandler -p 10kHz -o real.json
+  python timeline_calib.py timeline.json -p 1ms,10us       (firmware switches SysTick between 1 kHz and 100 kHz)
 
 The reference function must be in the timeline: do not filter it out with orbprofile -G.
 The result is as good as the reference: time is spread evenly over the instructions between two
@@ -17,6 +18,7 @@ reference calls, and time when the CPU sleeps is given to the instructions aroun
 """
 import argparse
 import bisect
+import math
 import re
 import statistics
 import sys
@@ -45,10 +47,16 @@ def period_us(text):
     return us
 
 
+def period_list(text):
+    return sorted(set(period_us(t) for t in text.split(',')), reverse=True)
+
+
 ap = argparse.ArgumentParser(description="Scale an orbprofile timeline to real time using a function that runs at a known rate")
 ap.add_argument("timeline", help="timeline file written by orbprofile -g")
 ap.add_argument("-r", "--reference", default="SysTick_Handler", help="function that runs at a fixed rate (default SysTick_Handler)")
-ap.add_argument("-p", "--period", type=period_us, default=period_us("1ms"), help="its period or rate: 1ms, 250us, 1kHz ... (default 1ms)")
+ap.add_argument("-p", "--period", type=period_list, default=period_list("1ms"),
+                help="its period or rate: 1ms, 250us, 1kHz ... (default 1ms). If the firmware changes the rate while it "
+                     "runs, give every rate used, e.g. 1ms,10us: each stretch gets the one that fits it")
 ap.add_argument("-o", "--output", help="output file (default: <timeline>_calib.json)")
 ap.add_argument("-k", "--keep-gaps", action="store_true",
                 help="every stretch between two reference calls is exactly one period (default: a stretch much longer "
@@ -79,23 +87,35 @@ gaps = [b - c for c, b in zip(ref, ref[1:])]
 # ---- How many periods each stretch is --------------------------------------------------------
 # The instruction rate changes with what the program does, so compare each stretch with the ones
 # around it and not with the whole file.
-periods = []
 missed = 0
-for i, g in enumerate(gaps):
-    n = 1
-    if not a.keep_gaps:
-        near = gaps[max(0, i - 8):i] + gaps[i + 1:i + 9]
-        if near:
-            ratio = g / statistics.median(near)
-            if ratio > 1.7:
-                n = int(ratio + 0.5)
-                missed += n - 1
-    periods.append(n)
+span = []                                    # real time (us) of each stretch
+
+if len(a.period) > 1:
+    # Several rates. The longest stretches are the slowest rate; that gives the instruction rate of
+    # the CPU, and every stretch then gets the period that brings it closest to that rate.
+    top = sorted(gaps)[-max(1, len(gaps) // 100):]
+    top = [g for g in top if g > top[-1] / 1.7]
+    cpu = statistics.median(top) / a.period[0]           # counts per us
+    for g in gaps:
+        span.append(min(a.period, key=lambda p: abs(math.log(g / (p * cpu)))))
+else:
+    # One rate. The instruction rate changes with what the program does, so compare each stretch
+    # with the ones around it and not with the whole file.
+    for i, g in enumerate(gaps):
+        n = 1
+        if not a.keep_gaps:
+            near = gaps[max(0, i - 8):i] + gaps[i + 1:i + 9]
+            if near:
+                ratio = g / statistics.median(near)
+                if ratio > 1.7:
+                    n = int(ratio + 0.5)
+                    missed += n - 1
+        span.append(n * a.period[0])
 
 # Real time (us) at each reference call
 real = [0.0]
-for n in periods:
-    real.append(real[-1] + n * a.period)
+for t in span:
+    real.append(real[-1] + t)
 
 rate0 = (real[1] - real[0]) / gaps[0]        # us per count before the first reference call
 rateN = (real[-1] - real[-2]) / gaps[-1]     # and after the last one
@@ -135,11 +155,16 @@ with open(a.timeline, "r", encoding="utf-8", errors="replace") as f, open(out, "
             o.write(line)
 
 # ---- Report ----------------------------------------------------------------------------------
-per = sorted(g / n for g, n in zip(gaps, periods))
-p_s = a.period / 1e6
-print("%d events, %d calls of %s used as the reference (period %g ms)" % (events, len(ref), a.reference, a.period / 1e3))
-print("%s per period: min %.0f  median %.0f  max %.0f" % (unit.capitalize(), per[0], statistics.median(per), per[-1]))
-print("That is %.1f to %.1f million %s per second" % (per[0] / p_s / 1e6, per[-1] / p_s / 1e6, unit))
+rate = sorted(g / t for g, t in zip(gaps, span))          # counts per us = millions per second
+print("%d events, %d calls of %s used as the reference" % (events, len(ref), a.reference))
+for p in a.period:
+    n = sum(1 for t in span if t == p)
+    if len(a.period) > 1 or n:
+        print("  period %g ms: %d stretches" % (p / 1e3, n))
+print("Speed: %.1f to %.1f million %s per second (median %.1f)" % (rate[0], rate[-1], unit, statistics.median(rate)))
+if rate[-1] > 3 * statistics.median(rate) or rate[0] < statistics.median(rate) / 3:
+    print("WARNING: the speed varies a lot. The reference may not run at the rate(s) given all the time,\n"
+          "or trace was lost; the result is not reliable where that happens.")
 if missed:
     print("%d reference call(s) look missed (interrupts masked or trace lost); those stretches were taken as\n"
           "several periods. Use -k to treat every stretch as one period instead." % missed)
