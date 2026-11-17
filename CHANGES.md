@@ -1,4 +1,5 @@
 Version 2.3.0 In progress
+* orbprofile: function timeline (-g <file>, -G <min length>): every call and exception as Chrome trace JSON, for ui.perfetto.dev or chrome://tracing
 * orbprofile: live mode (-l <ms>): runs until CTRL-C, rewrites the coverage file and reports lines/functions/branches covered at every interval; -I 0 captures until CTRL-C
 * orbprofile: when running until stopped, a full capture buffer discards data and resyncs instead of ending the capture; file input waits for the decoder
 * orbprofile/orbtop (symbols): keep the line number of code objdump shows without source text (loops, code after a nested block, source file not found). Coverage missed those instructions and their branches.

@@ -30,6 +30,7 @@
 #define TICK_TIME_MS        (1)          /* Time intervals for checks */
 #define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
 #define LIVE_MIN_INTERVAL_MS (200)       /* Fastest live update, in mS */
+#define TIMELINE_MAX_EVENTS (5000000)    /* Most calls written to a timeline file (about 100 bytes each) */
 #define HANDLE_MASK         (0xFFFFFF)   /* cachegrind cannot cope with large file handle numbers */
 
 enum Prot { PROT_OFLOW, PROT_ETM, PROT_UNKNOWN };
@@ -81,6 +82,8 @@ struct Options                           /* Record for options, either defaults 
     char *profile;                       /* File to output profile information */
     char *lcovfile;                      /* File to output lcov coverage information */
     int  sampleDuration;                 /* How long we are going to sample for (0 = until stopped) */
+    char *timelineFile;                  /* File to output the function timeline (Chrome trace JSON) */
+    uint32_t timelineMin;                /* Shortest call to put in the timeline, in instructions (or cycles) */
     int  liveInterval;                   /* Live mode: rewrite the coverage file and report this often, in ms (0 = off) */
     int  bufferMB;                       /* Capture buffer size in MiB */
     bool mono;                           /* Supress colour in output */
@@ -163,6 +166,9 @@ struct RunTime
     uint64_t packetCycles;                      /* Cycles reported in cycle count packets */
     uint64_t callsCount;                        /* Call data count */
     uint64_t intervalBytes;                     /* Number of bytes transferred in current interval */
+    FILE *timeline;                             /* Timeline output, while open */
+    uint64_t timelineEvents;                    /* Calls written to the timeline */
+    uint64_t timelineSkipped;                   /* Calls left out (too short, or the file limit was reached) */
     uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
     volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
     uint32_t lastLive;                          /* When the last live update was made */
@@ -205,6 +211,75 @@ struct RunTime
 // Internally available routines
 // ====================================================================================================
 // ====================================================================================================
+// ====================================================================================================
+static uint64_t _timelineNow( struct RunTime *r )
+
+/* Timeline time: cycles if the trace is cycle accurate, otherwise instructions executed */
+
+{
+    return r->cyclesExecuted ? r->cyclesExecuted : r->instExecuted;
+}
+// ====================================================================================================
+static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
+
+/* A call (or exception) has ended: write it to the timeline as one complete event */
+
+{
+    struct nameEntry n;
+    char name[256];
+    const char *f;
+    uint64_t start = r->cyclesExecuted ? a->inCycles : a->inTicks;
+    uint64_t dur   = _timelineNow( r ) - start;
+    int o = 0;
+
+    if ( !r->timeline )
+    {
+        return;
+    }
+
+    if ( ( dur < r->options->timelineMin ) || ( r->timelineEvents >= TIMELINE_MAX_EVENTS ) )
+    {
+        r->timelineSkipped++;
+        return;
+    }
+
+    f = SymbolLookup( r->s, a->sig.dst, &n ) ? SymbolFunction( r->s, n.functionindex ) : NULL;
+
+    if ( !f )
+    {
+        snprintf( name, sizeof( name ), "0x%08x", a->sig.dst );
+    }
+    else
+    {
+        /* JSON string: escape quotes and backslashes (C++ names) */
+        for ( ; ( *f ) && ( o < ( int )sizeof( name ) - 2 ); f++ )
+        {
+            if ( ( *f == '"' ) || ( *f == '\\' ) )
+            {
+                name[o++] = '\\';
+            }
+
+            name[o++] = ( ( unsigned char ) * f < 0x20 ) ? ' ' : *f;
+        }
+
+        name[o] = 0;
+    }
+
+    fprintf( r->timeline, "%s{\"name\":\"%s\",\"ph\":\"X\",\"ts\":%" PRIu64 ",\"dur\":%" PRIu64 ",\"pid\":1,\"tid\":1}",
+             r->timelineEvents ? ",\n" : "", name, start, dur ? dur : 1 );
+    r->timelineEvents++;
+}
+// ====================================================================================================
+static void _timelineCloseOpenCalls( struct RunTime *r )
+
+/* The call stack is being abandoned (end of capture, or resync): the open calls end here */
+
+{
+    for ( uint32_t d = r->substacklen; d; d-- )
+    {
+        _timelineCall( r, &r->substack[d - 1] );
+    }
+}
 // ====================================================================================================
 static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
 
@@ -300,6 +375,7 @@ static uint32_t _returnEvent( struct RunTime *r, uint32_t to, bool mustMatch )
         DBG_OUT( " DEC:%3d %08x (wanted %08x)" EOL, r->substacklen + 1, a->sig.src, to );
         HASH_FIND( hh, r->subhead, &a->sig, sizeof( struct subcallSig ), s );
         assert( s );
+        _timelineCall( r, a );
 
         /* Inclusive costs: what was executed and visited while this call was open */
         s->myCost   += r->instExecuted - a->inTicks;
@@ -915,6 +991,10 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Capture buffer size (default %d). Decoding is slower than a fast" EOL, DEFAULT_BUFFER_MB );
     genericsFPrintf( stderr, "                        CPU makes ETM data, so this sets how long a capture can be" EOL );
     genericsFPrintf( stderr, "    -c, --coverage-file: <Filename> lcov tracefile for line, function and branch coverage" EOL );
+    genericsFPrintf( stderr, "    -g, --timeline-file: <Filename> timeline of function calls and exceptions (Chrome trace JSON," EOL );
+    genericsFPrintf( stderr, "                        for ui.perfetto.dev or chrome://tracing). Time is in instructions," EOL );
+    genericsFPrintf( stderr, "                        or in cycles with cycle accurate trace" EOL );
+    genericsFPrintf( stderr, "    -G, --timeline-min: <Count> leave calls shorter than this out of the timeline (default 0)" EOL );
     genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time to capture (in ms, default %d), 0 = until CTRL-C" EOL, DEFAULT_DURATION_MS );
     genericsFPrintf( stderr, "    -l, --live:         <Interval> Live mode: capture until CTRL-C (or for -I), rewriting the coverage" EOL );
     genericsFPrintf( stderr, "                        file and reporting progress every <Interval> ms" EOL );
@@ -956,6 +1036,8 @@ static struct option _longOptions[] =
     {"help", no_argument, NULL, 'h'},
     {"interval", required_argument, NULL, 'I'},
     {"live", required_argument, NULL, 'l'},
+    {"timeline-file", required_argument, NULL, 'g'},
+    {"timeline-min", required_argument, NULL, 'G'},
     {"buffer-size", required_argument, NULL, 'b'},
     {"coverage-file", required_argument, NULL, 'c'},
     {"no-colour", no_argument, NULL, 'M'},
@@ -981,7 +1063,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool serverExplicit = false;
     bool durationSet = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:hVI:l:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:g:G:hVI:l:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
@@ -1046,6 +1128,16 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
             case 'I':
                 r->options->sampleDuration = atoi( optarg );
                 durationSet = true;
+                break;
+
+            // ------------------------------------
+            case 'g':
+                r->options->timelineFile = optarg;
+                break;
+
+            // ------------------------------------
+            case 'G':
+                r->options->timelineMin = strtoul( optarg, NULL, 0 );
                 break;
 
             // ------------------------------------
@@ -1406,6 +1498,7 @@ static void *_processBlocks( void *params )
             r->op.workingAddr = NO_DESTADDRESS;
             r->op.etm4Pending = false;
             r->op.etm4ExPending = false;
+            _timelineCloseOpenCalls( r );
             r->substacklen = 0;
         }
 
@@ -1500,6 +1593,18 @@ int main( int argc, char *argv[] )
     }
 
     _r.rawBlock[0].fillLevel = 0;
+
+    if ( _r.options->timelineFile )
+    {
+        _r.timeline = fopen( _r.options->timelineFile, "wb" );
+
+        if ( !_r.timeline )
+        {
+            genericsExit( -1, "Can't write %s" EOL, _r.options->timelineFile );
+        }
+
+        fprintf( _r.timeline, "{\"displayTimeUnit\":\"ns\",\"traceEvents\":[\n" );
+    }
 
     TRACEDecoderInit( &_r.i, _r.options->tProtocol, !_r.options->noaltAddr, genericsReport );
     OFLOWInit( &_r.c );
@@ -1663,6 +1768,17 @@ int main( int argc, char *argv[] )
     if ( _r.liveUpdates )
     {
         genericsFPrintf( stderr, EOL );
+    }
+
+    if ( _r.timeline )
+    {
+        _timelineCloseOpenCalls( &_r );
+        fprintf( _r.timeline, "%s{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"%s (time in %s)\"}}\n]}\n",
+                 _r.timelineEvents ? ",\n" : "", genericsBasename( _r.options->elffile ), _r.cyclesExecuted ? "cycles" : "instructions" );
+        fclose( _r.timeline );
+        _r.timeline = NULL;
+        genericsReport( V_WARN, "Timeline: %" PRIu64 " calls written, %" PRIu64 " left out (time in %s)" EOL, _r.timelineEvents, _r.timelineSkipped,
+                        _r.cyclesExecuted ? "cycles" : "instructions" );
     }
 
     /* Data are collected, now process and report */

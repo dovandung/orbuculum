@@ -850,6 +850,10 @@ The command line options are;
 
  `-f, --input-file [filename]`: Take input from specified file
 
+ `-g, --timeline-file [Filename]`: Timeline of function calls and exceptions, as Chrome trace JSON
+
+ `-G, --timeline-min [Count]`: Leave calls shorter than this out of the timeline (default 0)
+
  `-I, --interval [Interval]`: Time to capture, in ms (default 1000). 0 = until CTRL-C.
 
  `-l, --live [Interval]`: Live mode. Capture until CTRL-C (or for `-I` if given), rewriting the coverage file and printing the lines, functions and branches covered so far every [Interval] ms. The profile and call graph are written at the end.
@@ -895,6 +899,13 @@ orbprofile -e firmware.elf -c coverage.info -l 1000
 
 Stop with CTRL-C to get the final files. If decoding cannot keep up with the trace the oldest undecoded data are
 discarded (shown as DROPPED) and decoding carries on from the next sync in the trace; a larger `-b` delays that.
+
+**Function timeline.** `-g timeline.json` records every function call and exception with its start and length.
+Open the file at https://ui.perfetto.dev (Open trace file) or in `chrome://tracing` to get a zoomable picture of
+what ran when, with calls nested under their callers and interrupt handlers nested where they interrupted. Time is
+counted in instructions executed, or in CPU cycles when the ETM is cycle accurate (the viewer labels it as
+microseconds). A busy target makes millions of calls per second: use `-G` to leave out short calls (e.g. `-G 50`),
+and a short `-I`. At most 5 million calls are written.
 
 Things to know;
 
