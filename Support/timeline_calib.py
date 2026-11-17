@@ -139,9 +139,12 @@ with open(a.timeline, "r", encoding="utf-8", errors="replace") as f, open(out, "
         m = EVENT.match(line)
         if m:
             ts, dur = float(m.group(4)), float(m.group(6))
-            t0, t1 = to_real(ts), to_real(ts + dur)
-            last = max(last, t1)
-            o.write("%s%s%s%.3f%s%.3f%s" % (m.group(1), m.group(2), m.group(3), t0, m.group(5), max(t1 - t0, 0.001), m.group(7)))
+            # Whole nanoseconds for both ends, and the length from those: rounding the start and the
+            # length separately can push a call 1 ns past the end of the call it is inside
+            t0, t1 = int(round(to_real(ts) * 1000)), int(round(to_real(ts + dur) * 1000))
+            last = max(last, t1 / 1000)
+            o.write("%s%s%s%d.%03d%s%d.%03d%s" % (m.group(1), m.group(2), m.group(3), t0 // 1000, t0 % 1000,
+                                                 m.group(5), (t1 - t0) // 1000, (t1 - t0) % 1000, m.group(7)))
         else:
             p = PROCESS.search(line)
             n = NAMEARG.search(line)
