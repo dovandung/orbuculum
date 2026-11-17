@@ -912,7 +912,14 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time between samples (in ms)" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
-    genericsFPrintf( stderr, "    -P, --trace-proto:  {ETM35|MTB} trace protocol to use, default is ETM35" EOL );
+    genericsFPrintf( stderr, "    -P, --trace-proto:  { " );
+
+    for ( int i = TRACE_PROT_LIST_START; i < TRACE_PROT_LIST_END; i++ )
+    {
+        genericsFPrintf( stderr, "%s ", TRACEDecodeGetProtocolName( i ) );
+    }
+
+    genericsFPrintf( stderr, "} trace protocol to use, default is %s" EOL, TRACEDecodeGetProtocolName( TRACE_PROT_LIST_START ) );
     genericsFPrintf( stderr, "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise raw ETM" EOL );
     genericsFPrintf( stderr, "    -s, --server:       <Server>:<Port> to use" EOL );
     genericsFPrintf( stderr, "    -t, --tag:          <stream>: Which OFLOW tag to use (normally 2)" EOL );

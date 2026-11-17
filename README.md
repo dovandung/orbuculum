@@ -8,6 +8,16 @@
 
 ![Screenshot](https://raw.githubusercontent.com/orbcode/orbuculum/main/Docs/title.png)
 
+**This fork** (dovandung/orbuculum) is Orbuculum 2.2.0 plus the changes listed at the top of [CHANGES.md](CHANGES.md). The main additions are:
+
+* `orbprofile`: code coverage straight from ETM trace (`-c`, lcov format with line, function and branch coverage), conditional branch counts in the KCacheGrind output, ETM4 (Cortex-M7) support, cycle counts from cycle-accurate ETM3.5, a capture buffer (`-b`) and corrected call costs.
+* `orbmortem`: ETM4 decode fixes, hold at a function or address (`-x`), windowed decode of large buffers (`-W`), dive into the function under the cursor.
+* `orbtop`: three-decimal percentages and a cutoff option (`-k`).
+* `Support/orb2lcov.py`: lcov coverage from saved `orbprofile` KCacheGrind files.
+* libdwarf updated to 2.3.3. Windows binaries are built on every push (Actions, artifact `orbuculum-win64`).
+
+See the [Orbprofile](#orbprofile) and [Orbmortem](#orbmortem) sections below.
+
 This is Orbuculum V2.2.0. Bugfixes for 2.2.x will be done in this branch. Development is generally done in feature branches and folded into main as those features mature - those are post 2.2.0.
 
 Version 2.2.0 builds on 2.1.0 and adds several new CPU families, improved client application handling and the start of ETM4 support. Stats and timing are also much improved and the whole communications subsystem has been simplified and streamlined. Most importantly though, we have moved from 'legacy' protocol (basically, the exact same protocol that flows from the chip) for communications to 'orbflow' protocol. Orbflow protocol is an extensible packet oriented protocol which provides a more compact representation of the probe data. By default orbflow is used transparently between orbuculum and client applications. If you have an ORBTrace 1.4.0 or higher version then it is also used for communication from the probe to orbuculum. If you have your own legacy applications, or a version of ORBTrace less that 1.4.0, then the system will fall back to legacy protocol transparently. You can have a hybrid arrangement where some clients use legacy protocol and some use orbflow no problem.  As you might imagine this can quickly become complex so please yell up if any edge cases don't seem to work correctly!
@@ -50,6 +60,8 @@ data from the target and make it available to clients whenever it can.
 * orbdump: A utility for dumping raw SWO data to a file for post-processing.
 
 * orbmortem: A post mortem analysis tool.
+
+* orbprofile: Profile, call graph and code coverage (line, function and branch) from ETM instruction trace.
 
 * orbtop: A top utility to see what's actually going on with your target. It can also
 generate input files for dot and gnuplot for perty graphics.
@@ -697,6 +709,8 @@ Command line options for orbtop are;
 
  `-j, --json-file [filename]`: Output to file in JSON format (or screen if <filename> is '-')
 
+ `-k, --cutoff [percent]`: Lowest percentage to report (defaults to 0.1, 0 reports all)
+
  `-l, --agg-lines`: Aggregate per line rather than per function
 
  `-n, --itm-sync`: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)
@@ -763,15 +777,15 @@ tested and contributions on solidifying it are welcome.
 
 The command line options of note are;
 
- `-a, --alt-addr-enc`: Don't use alternate address encoding. Select this if decodes don't seem to arrive correctly. You can discover if you need this option by using the `describeETM` command inside the debugger.
+ `-A, --alt-addr-enc`: Don't use alternate address encoding. Select this if decodes don't seem to arrive correctly. You can discover if you need this option by using the `describeETM` command inside the debugger.
 
  `-b, --buffer-len [Length]`: Set length of post-mortem buffer, in KBytes (Default 32 KBytes)
 
- `-c, --editor-cmd [command]`: Set command line for external editor ( %%f = filename, %%l = line). A few examples are;
+ `-C, --editor-cmd [command]`: Set command line for external editor ( %f = filename, %l = line). A few examples are;
 
-     * emacs; `-c emacs "+%l %f"`
-     * codium/VSCode; `-c codium  -g "%f:%l"`
-     * eclipse; `-c eclipse "%f:%l"`
+     * emacs; `-C emacs "+%l %f"`
+     * codium/VSCode; `-C codium  -g "%f:%l"`
+     * eclipse; `-C eclipse "%f:%l"`
 
  `-D, --no-demangle`: Switch off C++ symbol demangling
 
@@ -785,14 +799,111 @@ The command line options of note are;
 
  `-h, --help`: Provide brief help
 
- `-p, --trace-proto [protocol]`: to use, where protocols are MTB or ETM35 (default). Note that MTB only makes sense from a file.
+ `-O, --objdump-opts [options]`: Options to pass directly to objdump
+
+ `-p, --protocol [OFLOW|ETM]`: Protocol to communicate with the source. Defaults to OFLOW if `-s` is not set, otherwise ETM.
+
+ `-P, --trace-proto [ETM3.5|MTB|ETM4]`: Trace protocol of the CPU. ETM3.5 (default) for Cortex-M3/M4, ETM4 for Cortex-M7. Note that MTB only makes sense from a file.
 
  `-s, --server [Server:Port]`: to use
 
  `-t, --tag [number]`: Specify tag to decode, defaults to 2.
 
+ `-W, --window [Length]`: Decode this much of the buffer at a time, in KBytes (Default 256 KBytes). Up, PgUp or Home at the top of the display decodes the part before it, Down, PgDown or End at the bottom the part after it.
+
+ `-x, --hold-at [function | 0xaddress]`: Hold as soon as the trace reaches this function (or address). Release with `H` to wait for the next time.
+
 
 Once it's running you will receive an indication at the lower right of the screen that it's capturing data. Hitting `H` will hold the capture and it will decode whatever is currently in the buffer. More usefully, if the capture stream is lost (e.g. because of debugger entry) then it will auto-hold and decode the buffer, showing you the last instructions executed. You can use the arrow keys to move around this buffer and dive into individual source files. Hit the `?` key for a quick overview of available commands.
+
+
+Orbprofile
+----------
+
+Orbprofile captures ETM instruction trace for a set time and then reports what ran: an exact profile for
+KCacheGrind, a call graph, and a code coverage file. Nothing is added to the target program, so the results
+come from the real build running at full speed. Like orbmortem it needs a parallel trace source
+streaming ETM (the `startETM` command), and `arm-none-eabi-objdump` on the path (or named by the `OBJDUMP`
+environment variable).
+
+A typical command line is;
+
+```
+orbprofile -e firmware.elf -I 10000 -c coverage.info -z profile.out -y calls.dot
+```
+
+The command line options are;
+
+ `-A, --alt-addr-enc`: Switch off alternate address decoding (on by default)
+
+ `-b, --buffer-size [MiB]`: Capture buffer size (default 256). Decoding is slower than a fast CPU makes ETM data, so this sets how long a capture can be.
+
+ `-c, --coverage-file [Filename]`: lcov tracefile with line, function and branch coverage
+
+ `-D, --no-demangle`: Switch off C++ symbol demangling
+
+ `-d, --del-prefix [String]`: Material to delete off front of filenames
+
+ `-e, --elf-file [ElfFile]`: to use for symbols
+
+ `-E, --eof`: When reading from file, terminate at end of file
+
+ `-f, --input-file [filename]`: Take input from specified file
+
+ `-I, --interval [Interval]`: Time to capture, in ms (default 1000)
+
+ `-O, --objdump-opts [options]`: Options to pass directly to objdump
+
+ `-p, --protocol [OFLOW|ETM]`: Protocol to communicate with the source. Defaults to OFLOW if `-s` is not set, otherwise raw ETM.
+
+ `-P, --trace-proto [ETM3.5|MTB|ETM4]`: Trace protocol of the CPU. ETM3.5 (default) for Cortex-M3/M4, ETM4 for Cortex-M7.
+
+ `-s, --server [Server:Port]`: to use
+
+ `-t, --tag [number]`: Specify tag to decode, defaults to 2.
+
+ `-T, --all-truncate`: Truncate `-d` material off all references (i.e. make output relative)
+
+ `-y, --graph-file [Filename]`: dot file for a structured call graph (`dot -Tpdf calls.dot -o calls.pdf`)
+
+ `-z, --cache-file [Filename]`: Profile for KCacheGrind, with instruction counts, source line visits, cycles (cycle-accurate ETM3.5) and how often each conditional jump was taken
+
+**Code coverage.** The file written by `-c` lists every source line, function and conditional branch
+(`B<cond>`, `CBZ`, `CBNZ`) of the program, including those that never ran. A line's count is the most any of its
+instructions ran, a function's count is how often its first instruction ran, and each conditional branch has two
+outcomes, jumped and fell through. Turn it into a report with any lcov tool;
+
+```
+genhtml --branch-coverage coverage.info -o report                 (Linux, or WSL)
+reportgenerator -reports:coverage.info -targetdir:report          (Windows)
+```
+
+or show it in an editor (e.g. the Coverage Gutters extension for VS Code). Several runs can be added together
+with `lcov -a run1.info -a run2.info -o total.info`. `Support/orb2lcov.py` makes the same coverage from saved
+`-z` files (`python3 Support/orb2lcov.py -e firmware.elf -o coverage.info run1.out run2.out`, needs
+`pyelftools`), with `-i`/`-x` to choose source files.
+
+Things to know;
+
+* If the ETM overflows, executed code is missing from the trace and can show as not run. For exact coverage
+  let the ETM stall the CPU instead (`startETM 0 1`).
+* Instructions made conditional by an `IT` block are not counted as branches.
+* ETM4 handling in orbprofile has been checked against simulated Cortex-M7 traces only, not yet on hardware.
+* On Windows, source paths in the coverage file are `D:/...`. For `genhtml` under WSL convert them first:
+  `sed -i 's#^SF:D:#SF:/mnt/d#' coverage.info`.
+
+Using a probe that sends raw TPIU over TCP
+------------------------------------------
+
+Any program that offers the raw parallel trace stream (TPIU frames) on a TCP port can feed the suite, for example
+an FPGA capture board with its own receiver program. Point orbuculum at it and let it remove the TPIU framing;
+
+```
+orbuculum -s localhost:3450 -T -t 1,2
+```
+
+`-t 1,2` lists the trace sources to separate out: 1 is the ITM (set with `ITMId 1`) and 2 is the ETM (set by
+`startETM`). The clients then connect to orbuculum as usual.
 
 
 Reliability
