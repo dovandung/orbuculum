@@ -361,11 +361,12 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to, struct
         return;
     }
 
-    if ( ( r->timeline ) && ( !r->substacklen ) )
+    if ( ( r->timeline ) && ( !r->substacklen ) && ( from ) )
     {
-        /* A call with none open: the caller is the function at the bottom of the timeline */
-        struct nameEntry n;
-        uint32_t fn = from ? from->functionindex : ( SymbolLookup( r->s, retAddr, &n ) ? n.functionindex : NO_FUNCTION );
+        /* A call with none open: the caller is the function at the bottom of the timeline. */
+        /* (Not for an exception: when it is taken on a return, the address it interrupts   */
+        /* is not known yet and would name the function just left.)                         */
+        uint32_t fn = from->functionindex;
 
         if ( ( _isFunction( fn ) ) && ( fn != r->rootFn ) )
         {
