@@ -233,6 +233,26 @@ static uint64_t _timelineNow( struct RunTime *r )
     return r->cyclesExecuted ? r->cyclesExecuted : r->instExecuted;
 }
 // ====================================================================================================
+static void _jsonString( const char *in, char *out, size_t outLen )
+
+/* Copy text for use inside a JSON string: escape quotes and backslashes, blank control characters */
+
+{
+    size_t o = 0;
+
+    for ( ; ( *in ) && ( o + 2 < outLen ); in++ )
+    {
+        if ( ( *in == '"' ) || ( *in == '\\' ) )
+        {
+            out[o++] = '\\';
+        }
+
+        out[o++] = ( ( unsigned char ) * in < 0x20 ) ? ' ' : *in;
+    }
+
+    out[o] = 0;
+}
+// ====================================================================================================
 static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
 
 /* A call (or exception) has ended: write it to the timeline as one complete event */
@@ -243,7 +263,6 @@ static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
     const char *f;
     uint64_t start = r->cyclesExecuted ? a->inCycles : a->inTicks;
     uint64_t dur   = _timelineNow( r ) - start;
-    int o = 0;
 
     if ( !r->timeline )
     {
@@ -264,18 +283,7 @@ static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
     }
     else
     {
-        /* JSON string: escape quotes and backslashes (C++ names) */
-        for ( ; ( *f ) && ( o < ( int )sizeof( name ) - 2 ); f++ )
-        {
-            if ( ( *f == '"' ) || ( *f == '\\' ) )
-            {
-                name[o++] = '\\';
-            }
-
-            name[o++] = ( ( unsigned char ) * f < 0x20 ) ? ' ' : *f;
-        }
-
-        name[o] = 0;
+        _jsonString( f, name, sizeof( name ) );
     }
 
     fprintf( r->timeline, "%s{\"name\":\"%s\",\"ph\":\"X\",\"ts\":%" PRIu64 ",\"dur\":%" PRIu64 ",\"pid\":1,\"tid\":1}",
@@ -1901,8 +1909,22 @@ int main( int argc, char *argv[] )
     if ( _r.timeline )
     {
         _timelineCloseOpenCalls( &_r );
+
+        /* Program name without its path (either separator, for Windows), made safe for JSON */
+        const char *pn = _r.options->elffile;
+        char pname[200];
+
+        for ( const char *c = pn; *c; c++ )
+        {
+            if ( ( *c == '/' ) || ( *c == '\\' ) )
+            {
+                pn = c + 1;
+            }
+        }
+
+        _jsonString( pn, pname, sizeof( pname ) );
         fprintf( _r.timeline, "%s{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"%s (time in %s)\"}}\n]}\n",
-                 _r.timelineEvents ? ",\n" : "", genericsBasename( _r.options->elffile ), _r.cyclesExecuted ? "cycles" : "instructions" );
+                 _r.timelineEvents ? ",\n" : "", pname, _r.cyclesExecuted ? "cycles" : "instructions" );
         fclose( _r.timeline );
         _r.timeline = NULL;
         genericsReport( V_WARN, "Timeline: %" PRIu64 " calls written, %" PRIu64 " left out (time in %s)" EOL, _r.timelineEvents, _r.timelineSkipped,
