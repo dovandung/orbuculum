@@ -172,6 +172,8 @@ struct RunTime
     FILE *timeline;                             /* Timeline output, while open */
     uint64_t timelineEvents;                    /* Calls written to the timeline */
     uint64_t timelineSkipped;                   /* Calls left out (too short, or the file limit was reached) */
+    uint32_t rootFn;                            /* Function running with no call open (main, usually), or NO_FUNCTION */
+    uint64_t rootStart;                         /* ...and when it started, or when the last one ended */
     uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
     volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
     uint32_t lastLive;                          /* When the last live update was made */
@@ -291,6 +293,40 @@ static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
     r->timelineEvents++;
 }
 // ====================================================================================================
+static bool _isFunction( uint32_t fn )
+
+{
+    return ( fn != NO_FUNCTION ) && ( ( fn & SPECIALS_MASK ) != SPECIALS_MASK );
+}
+// ====================================================================================================
+static void _timelineRootClose( struct RunTime *r )
+
+/* The function that was running with no call open (the one the trace started in, normally main) */
+/* ends here. Its own call was before the trace, so it gets a bar from where it was first seen.  */
+
+{
+    char name[256];
+    uint64_t now = _timelineNow( r );
+
+    if ( ( r->timeline ) && ( _isFunction( r->rootFn ) ) )
+    {
+        if ( now - r->rootStart < r->options->timelineMin )
+        {
+            r->timelineSkipped++;
+        }
+        else
+        {
+            _jsonString( SymbolFunction( r->s, r->rootFn ), name, sizeof( name ) );
+            fprintf( r->timeline, "%s{\"name\":\"%s\",\"ph\":\"X\",\"ts\":%" PRIu64 ",\"dur\":%" PRIu64 ",\"pid\":1,\"tid\":1}",
+                     r->timelineEvents ? ",\n" : "", name, r->rootStart, ( now > r->rootStart ) ? now - r->rootStart : 1 );
+            r->timelineEvents++;
+        }
+    }
+
+    r->rootFn = NO_FUNCTION;
+    r->rootStart = now;
+}
+// ====================================================================================================
 static void _timelineCloseOpenCalls( struct RunTime *r )
 
 /* The call stack is being abandoned (end of capture, or resync): the open calls end here */
@@ -300,6 +336,14 @@ static void _timelineCloseOpenCalls( struct RunTime *r )
     {
         _timelineCall( r, &r->substack[d - 1] );
     }
+
+    if ( ( !_isFunction( r->rootFn ) ) && ( !r->substacklen ) && ( r->op.h ) )
+    {
+        /* Nothing was called since the last one ended: it is the function we are in */
+        r->rootFn = r->op.h->functionindex;
+    }
+
+    _timelineRootClose( r );
 }
 // ====================================================================================================
 static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to, struct execEntryHash *from )
@@ -315,6 +359,23 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to, struct
     if ( retAddr == to )
     {
         return;
+    }
+
+    if ( ( r->timeline ) && ( !r->substacklen ) )
+    {
+        /* A call with none open: the caller is the function at the bottom of the timeline */
+        struct nameEntry n;
+        uint32_t fn = from ? from->functionindex : ( SymbolLookup( r->s, retAddr, &n ) ? n.functionindex : NO_FUNCTION );
+
+        if ( ( _isFunction( fn ) ) && ( fn != r->rootFn ) )
+        {
+            if ( _isFunction( r->rootFn ) )
+            {
+                _timelineRootClose( r );
+            }
+
+            r->rootFn = fn;
+        }
     }
 
     /* ...add it to the call stack */
@@ -393,6 +454,21 @@ static uint32_t _returnEvent( struct RunTime *r, uint32_t to, bool mustMatch )
     {
         if ( ( mustMatch ) || ( !r->substacklen ) )
         {
+            struct nameEntry n;
+
+            if ( ( r->timeline ) && ( !mustMatch ) &&
+                    /* ...unless it stays in the same function: that is a computed jump (a switch), not a return */
+                    !( ( r->op.h ) && ( SymbolLookup( r->s, to, &n ) ) && ( n.functionindex == r->op.h->functionindex ) ) )
+            {
+                /* A return with no call open: the function at the bottom of the timeline is left */
+                if ( ( !_isFunction( r->rootFn ) ) && ( r->op.h ) )
+                {
+                    r->rootFn = r->op.h->functionindex;
+                }
+
+                _timelineRootClose( r );
+            }
+
             DBG_OUT( "NO CALL RETURNS TO %08x" EOL, to );
             return 0;
         }
@@ -1740,6 +1816,7 @@ int main( int argc, char *argv[] )
         }
 
         fprintf( _r.timeline, "{\"displayTimeUnit\":\"ns\",\"traceEvents\":[\n" );
+        _r.rootFn = NO_FUNCTION;
     }
 
     TRACEDecoderInit( &_r.i, _r.options->tProtocol, !_r.options->noaltAddr, genericsReport );
