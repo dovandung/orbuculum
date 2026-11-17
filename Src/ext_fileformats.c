@@ -495,7 +495,9 @@ bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHa
 
     qsort( ci, nci, sizeof( struct _covInstr ), _cov_sort_fn );
 
-    c = fopen( lcovfile, "w" );
+    /* Binary mode: on Windows text mode would end lines with \r\n, which lcov tools on Linux keep */
+    /* as part of file and test names.                                                            */
+    c = fopen( lcovfile, "wb" );
 
     if ( !c )
     {
