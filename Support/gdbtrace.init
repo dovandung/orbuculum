@@ -49,6 +49,7 @@ dwtSLEEPEVT       : Enable Sleep counter overflow event packet generation
 dwtDEVEVT         : Enable Exception counter overflow event packet generation
 dwtCPIEVT         : Enable CPI counter overflow event packet generation
 dwtTraceException : Enable Exception Trace Event packet generation
+dwtWatch          : Report accesses to a variable as data trace (for orbdata)
 dwtSamplePC       : Enable PC sample using POSTCNT interval
 dwtSyncTap        : Set how often Sync packets are sent out (None, CYCCNT[24], CYCCNT[26] or CYCCNT[28])
 dwtPostTap        : Sets the POSTCNT tap (CYCCNT[6] or CYCCNT[10])
@@ -1814,6 +1815,48 @@ define dwtTraceException
 end
 document dwtTraceException
 dwtTraceException <0|1> Enable Exception Trace Event packet generation
+end
+# ====================================================================
+define dwtWatch
+  #set language c
+
+  if ($argc<2)
+    help dwtWatch
+  else
+    setTRCENA
+    set $_wsize = 4
+    if ($argc>=3)
+      set $_wsize = $arg2
+    end
+    set $_wfn = 0xD
+    if ($argc>=4)
+      set $_wfn = $arg3
+    end
+    set $_wmask = 0
+    if ($_wsize==2)
+      set $_wmask = 1
+    end
+    if ($_wsize==4)
+      set $_wmask = 2
+    end
+    set $_wbase = $DWTBASE+0x20+16*$arg0
+    set *($_wbase+8) = 0
+    set *($_wbase)   = ((unsigned int)($arg1)) & ~((1<<$_wmask)-1)
+    set *($_wbase+4) = $_wmask
+    set *($_wbase+8) = $_wfn
+  end
+
+  #set language auto
+end
+document dwtWatch
+dwtWatch <Comp> <Address> [Size] [Function] Report accesses to a variable as data trace (for orbdata)
+  <Comp>     : Comparator to use, 0..3
+  <Address>  : Address of the variable, e.g. &g_counter
+  [Size]     : 1, 2 or 4 bytes (default 4)
+  [Function] : 0xD value on write (default), 0xC value on read, 2 value on read and write,
+               0xF PC and value on write, 0xE PC and value on read, 3 PC and value on both,
+               0 comparator off
+ITMTXEna 1 and ITMEna 1 are needed too. ARMv7-M (Cortex-M3/M4/M7) function codes.
 end
 # ====================================================================
 define dwtSamplePC

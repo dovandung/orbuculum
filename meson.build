@@ -150,6 +150,17 @@ executable('orbdump',
     install: true,
 )
 
+executable('orbdata',
+    sources: [
+        'Src/orbdata.c',
+        git_version_info_h,
+    ],
+    include_directories: incdirs,
+    dependencies: dependencies,
+    link_with: liborb,
+    install: true,
+)
+
 executable('orbstat',
     sources: [
         'Src/orbstat.c',

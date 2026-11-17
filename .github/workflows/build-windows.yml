@@ -58,7 +58,7 @@ jobs:
       - name: Check all tools were built
         working-directory: ./orbuculum/build/install/bin
         run: |
-          for t in orbuculum orbcat orbtop orbmortem orbprofile orbstat orbtrace orbdump orbzmq orblcd; do
+          for t in orbuculum orbcat orbtop orbmortem orbprofile orbstat orbdata orbtrace orbdump orbzmq orblcd; do
             [ -f $t.exe ] || { echo "::error::$t.exe was not built"; missing=1; }
           done
           [ -z "$missing" ]

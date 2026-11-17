@@ -61,6 +61,8 @@ data from the target and make it available to clients whenever it can.
 
 * orbmortem: A post mortem analysis tool.
 
+* orbdata: Logs the values of up to four variables as the target writes them (data trace), to CSV.
+
 * orbprofile: Profile, call graph and code coverage (line, function and branch) from ETM instruction trace.
 
 * orbtop: A top utility to see what's actually going on with your target. It can also
@@ -929,6 +931,66 @@ orbuculum -s localhost:3450 -T -t 1,2
 `-t 1,2` lists the trace sources to separate out: 1 is the ITM (set with `ITMId 1`) and 2 is the ETM (set by
 `startETM`). The clients then connect to orbuculum as usual.
 
+
+Orbdata
+-------
+
+Orbdata logs the value of a variable every time the target writes it, for up to four variables, without any
+change to the target program. It uses the data trace of the DWT: a comparator is given the address of the
+variable and sends the value written through the ITM (stream 1, over SWO or parallel trace). This is what other
+tools call data trace or a logic analyzer view.
+
+1. Set the comparators up in the target. `orbdata` prints the register writes for your variables, as gdb
+   commands, a Keil `.ini` file, an IAR `.mac` file or C;
+
+   ```
+   orbdata -e firmware.elf -w g_speed,d -w g_pwm -w g_temp,f --setup keil > datatrace.ini
+   ```
+
+   In gdb with `gdbtrace.init` loaded the same is `dwtWatch 0 &g_speed 4`, `dwtWatch 1 &g_pwm 4`, ...
+   with `ITMTXEna 1` and `ITMEna 1`. Add `ITMTSEna 1` for target timestamps.
+
+2. Log, with the same `-w` options in the same order (comparator n is the n'th `-w`);
+
+   ```
+   orbdata -e firmware.elf -w g_speed,d -w g_pwm -w g_temp,f -o data.csv -l 5000
+   python3 Support/orbdata_plot.py data.csv
+   ```
+
+The CSV columns are `time_s,ticks,variable,value,access,pc`: host time, target timestamp ticks (if on), and the
+address of the code that made the access when the setup was made with `-P`. A summary (count, min, max, last per
+variable) is printed at the end. Options;
+
+ `-a, --access [w|r|b]`: For `--setup`: report writes (default), reads or both
+
+ `-e, --elf-file [ElfFile]`: to find variables by name (global and static variables)
+
+ `-E, --eof`: Terminate when the file/socket ends/is closed
+
+ `-f, --input-file [filename]`: Take input from specified file
+
+ `-l, --length [ms]`: Stop after this time (default: until CTRL-C)
+
+ `-o, --output-file [filename]`: CSV file for the samples (default: the screen)
+
+ `-p, --protocol [OFLOW|ITM]`: Protocol to communicate. Defaults to OFLOW if `-s` is not set, otherwise ITM
+
+ `-P, --with-pc`: For `--setup`: also report the address of the code making the access
+
+ `-q, --quiet`: No samples on the screen, only the summary at the end
+
+ `-s, --server [Server:Port]`: to use
+
+ `-S, --setup [gdb|keil|iar|c]`: Print the target setup for the watched variables and exit
+
+ `-t, --tag [number]`: Specify tag to decode (normally 1)
+
+ `-w, --watch [name|0xaddress][,u|d|x|f[,1|2|4]]`: Variable for the next comparator, shown as unsigned, signed, hex or float, of 1, 2 or 4 bytes (default: its size in the ELF file)
+
+Limits: four comparators (Cortex-M3/M4/M7; the Cortex-M33 uses different function codes and is not supported),
+variables of up to 4 bytes at a fixed address, and a variable the compiler keeps in a register is never written
+to memory (make it `volatile`). A variable written very often can overflow the trace port, most easily on SWO.
+A debugger that sets data watchpoints uses the same comparators.
 
 Reliability
 ===========
