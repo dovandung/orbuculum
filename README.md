@@ -850,7 +850,9 @@ The command line options are;
 
  `-f, --input-file [filename]`: Take input from specified file
 
- `-I, --interval [Interval]`: Time to capture, in ms (default 1000)
+ `-I, --interval [Interval]`: Time to capture, in ms (default 1000). 0 = until CTRL-C.
+
+ `-l, --live [Interval]`: Live mode. Capture until CTRL-C (or for `-I` if given), rewriting the coverage file and printing the lines, functions and branches covered so far every [Interval] ms. The profile and call graph are written at the end.
 
  `-O, --objdump-opts [options]`: Options to pass directly to objdump
 
@@ -882,6 +884,17 @@ or show it in an editor (e.g. the Coverage Gutters extension for VS Code). Sever
 with `lcov -a run1.info -a run2.info -o total.info`. `Support/orb2lcov.py` makes the same coverage from saved
 `-z` files (`python3 Support/orb2lcov.py -e firmware.elf -o coverage.info run1.out run2.out`, needs
 `pyelftools`), with `-i`/`-x` to choose source files.
+
+**Live coverage.** With `-l` the coverage file is kept up to date while the target runs, so a viewer that reloads
+it (e.g. Coverage Gutters in watch mode) shows lines turning green as the tests reach them;
+
+```
+orbprofile -e firmware.elf -c coverage.info -l 1000
+   12 s     768.2 MB  912345678 instr  lines 412/530 (77.7%)  functions 61/70  branches 301/420 (71.7%)
+```
+
+Stop with CTRL-C to get the final files. If decoding cannot keep up with the trace the oldest undecoded data are
+discarded (shown as DROPPED) and decoding carries on from the next sync in the trace; a larger `-b` delays that.
 
 Things to know;
 

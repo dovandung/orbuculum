@@ -29,6 +29,7 @@
 
 #define TICK_TIME_MS        (1)          /* Time intervals for checks */
 #define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
+#define LIVE_MIN_INTERVAL_MS (200)       /* Fastest live update, in mS */
 #define HANDLE_MASK         (0xFFFFFF)   /* cachegrind cannot cope with large file handle numbers */
 
 enum Prot { PROT_OFLOW, PROT_ETM, PROT_UNKNOWN };
@@ -79,7 +80,8 @@ struct Options                           /* Record for options, either defaults 
     char *dotfile;                       /* File to output dot information */
     char *profile;                       /* File to output profile information */
     char *lcovfile;                      /* File to output lcov coverage information */
-    int  sampleDuration;                 /* How long we are going to sample for */
+    int  sampleDuration;                 /* How long we are going to sample for (0 = until stopped) */
+    int  liveInterval;                   /* Live mode: rewrite the coverage file and report this often, in ms (0 = off) */
     int  bufferMB;                       /* Capture buffer size in MiB */
     bool mono;                           /* Supress colour in output */
     bool noaltAddr;                      /* Dont use alternate addressing */
@@ -161,6 +163,10 @@ struct RunTime
     uint64_t packetCycles;                      /* Cycles reported in cycle count packets */
     uint64_t callsCount;                        /* Call data count */
     uint64_t intervalBytes;                     /* Number of bytes transferred in current interval */
+    uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
+    volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
+    uint32_t lastLive;                          /* When the last live update was made */
+    uint32_t liveUpdates;                       /* Number of live updates made */
 
     /* State of the target tracker */
     struct opConstruct op;                      /* The mechanical elements for creating the output buffer */
@@ -909,7 +915,9 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Capture buffer size (default %d). Decoding is slower than a fast" EOL, DEFAULT_BUFFER_MB );
     genericsFPrintf( stderr, "                        CPU makes ETM data, so this sets how long a capture can be" EOL );
     genericsFPrintf( stderr, "    -c, --coverage-file: <Filename> lcov tracefile for line, function and branch coverage" EOL );
-    genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time between samples (in ms)" EOL );
+    genericsFPrintf( stderr, "    -I, --interval:     <Interval> Time to capture (in ms, default %d), 0 = until CTRL-C" EOL, DEFAULT_DURATION_MS );
+    genericsFPrintf( stderr, "    -l, --live:         <Interval> Live mode: capture until CTRL-C (or for -I), rewriting the coverage" EOL );
+    genericsFPrintf( stderr, "                        file and reporting progress every <Interval> ms" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
     genericsFPrintf( stderr, "    -P, --trace-proto:  { " );
@@ -947,6 +955,7 @@ static struct option _longOptions[] =
     {"input-file", required_argument, NULL, 'f'},
     {"help", no_argument, NULL, 'h'},
     {"interval", required_argument, NULL, 'I'},
+    {"live", required_argument, NULL, 'l'},
     {"buffer-size", required_argument, NULL, 'b'},
     {"coverage-file", required_argument, NULL, 'c'},
     {"no-colour", no_argument, NULL, 'M'},
@@ -970,8 +979,9 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     int c, optionIndex = 0;
     bool protExplicit = false;
     bool serverExplicit = false;
+    bool durationSet = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:hVI:l:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
@@ -1035,6 +1045,18 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
             case 'I':
                 r->options->sampleDuration = atoi( optarg );
+                durationSet = true;
+                break;
+
+            // ------------------------------------
+            case 'l':
+                r->options->liveInterval = atoi( optarg );
+
+                if ( r->options->liveInterval < LIVE_MIN_INTERVAL_MS )
+                {
+                    r->options->liveInterval = LIVE_MIN_INTERVAL_MS;
+                }
+
                 break;
 
             // ------------------------------------
@@ -1171,7 +1193,13 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
         genericsExit( -2, "Elf File not specified" EOL );
     }
 
-    if ( !r->options->sampleDuration )
+    /* Live mode runs until stopped unless a time was given */
+    if ( ( r->options->liveInterval ) && ( !durationSet ) )
+    {
+        r->options->sampleDuration = 0;
+    }
+
+    if ( r->options->sampleDuration < 0 )
     {
         genericsExit( -2, "Illegal sample duration" EOL );
     }
@@ -1191,7 +1219,19 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     genericsReport( V_INFO, "Orbflow Tag     : %d" EOL, r->options->tag );
     genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
     genericsReport( V_INFO, "Coverage file   : %s" EOL, r->options->lcovfile ? r->options->lcovfile : "None" );
-    genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
+    if ( r->options->sampleDuration )
+    {
+        genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
+    }
+    else
+    {
+        genericsReport( V_INFO, "Sample Duration : until CTRL-C" EOL );
+    }
+
+    if ( r->options->liveInterval )
+    {
+        genericsReport( V_INFO, "Live updates    : every %d mS" EOL, r->options->liveInterval );
+    }
     genericsReport( V_INFO, "Capture buffer  : %d MiB" EOL, r->options->bufferMB );
 
     switch ( r->options->protocol )
@@ -1272,6 +1312,62 @@ static bool _queueBlock( struct RunTime *r, bool force )
     return true;
 }
 // ====================================================================================================
+static double _pct( uint32_t hit, uint32_t total )
+
+{
+    return total ? ( 100.0 * hit ) / total : 0.0;
+}
+// ====================================================================================================
+static void _liveUpdate( struct RunTime *r )
+
+/* Live mode: rewrite the coverage file with the results so far and report progress on one line. */
+/* The file is written under a temporary name and then renamed, so a reader never sees half of it. */
+
+{
+    struct coverageTotals t;
+    char tmpName[1024];
+    bool have = false;
+
+    r->lastLive = genericsTimestampmS();
+
+    if ( !HASH_COUNT( r->insthead ) )
+    {
+        return;
+    }
+
+    if ( r->options->lcovfile )
+    {
+        snprintf( tmpName, sizeof( tmpName ), "%s.tmp", r->options->lcovfile );
+
+        if ( ext_ff_outputLcov( tmpName, r->options->truncateDeleteMaterial ? r->options->deleteMaterial : NULL,
+                                r->insthead, r->s, &t ) )
+        {
+            /* rename doesn't replace an existing file on Windows */
+            remove( r->options->lcovfile );
+            have = ( 0 == rename( tmpName, r->options->lcovfile ) );
+        }
+    }
+
+    r->liveUpdates++;
+    genericsFPrintf( stderr, "\r%6u s  %8.1f MB  %" PRIu64 " instr", ( genericsTimestampmS() - r->starttime ) / 1000,
+                     ( double )r->intervalBytes / 1e6, r->instExecuted );
+
+    if ( have )
+    {
+        genericsFPrintf( stderr, "  lines %u/%u (%.1f%%)  functions %u/%u  branches %u/%u (%.1f%%)",
+                         t.linesHit, t.lines, _pct( t.linesHit, t.lines ), t.functionsHit, t.functions,
+                         t.branchesHit, t.branches, _pct( t.branchesHit, t.branches ) );
+    }
+
+    if ( r->droppedBytes )
+    {
+        genericsFPrintf( stderr, "  DROPPED %.1f MB", ( double )r->droppedBytes / 1e6 );
+    }
+
+    genericsFPrintf( stderr, "   " );
+    fflush( stderr );
+}
+// ====================================================================================================
 static void *_processBlocks( void *params )
 
 /* Generic block processor for received data. This runs in a task parallel to the receiver and *
@@ -1301,6 +1397,18 @@ static void *_processBlocks( void *params )
             break;
         }
 
+        if ( r->resync )
+        {
+            /* Blocks before this one were discarded: wait for the trace to say where it is again. */
+            /* The calls that were open can no longer be matched to their returns.                 */
+            r->resync = false;
+            TRACEDecoderForceSync( &r->i, false );
+            r->op.workingAddr = NO_DESTADDRESS;
+            r->op.etm4Pending = false;
+            r->op.etm4ExPending = false;
+            r->substacklen = 0;
+        }
+
         if ( PROT_OFLOW == r->options->protocol )
         {
             OFLOWPump( &_r.c, b->buffer, b->fillLevel, _OFLOWpacketRxed, &_r );
@@ -1314,6 +1422,13 @@ static void *_processBlocks( void *params )
         pthread_mutex_lock( &r->dataForClients_m );
         r->rp = ( r->rp + 1 ) % r->numBlocks;
         pthread_mutex_unlock( &r->dataForClients_m );
+
+        /* Live mode: results so far. Done here because this thread owns the instruction table. */
+        if ( ( r->options->liveInterval ) && ( r->sampling ) &&
+                ( ( genericsTimestampmS() - r->lastLive ) >= ( uint32_t )r->options->liveInterval ) )
+        {
+            _liveUpdate( r );
+        }
     }
 
     return NULL;
@@ -1492,17 +1607,35 @@ int main( int argc, char *argv[] )
             if ( ( rxBlock->fillLevel >= TRANSFER_SIZE ) ||
                     ( ( got == 0 ) && ( rxBlock->fillLevel > 0 ) && ( ( volatile int )_r.rp == _r.wp ) ) )
             {
-                if ( !_queueBlock( &_r, false ) )
+                /* A file can wait for the decoder, so nothing needs to be lost */
+                while ( ( _r.options->file ) && ( !_r.ending ) && ( !_queueBlock( &_r, false ) ) )
                 {
-                    genericsReport( V_WARN, "Capture buffer full after %u ms: stopping capture and decoding what was received" EOL,
-                                    _r.sampling ? genericsTimestampmS() - _r.starttime : 0 );
-                    rxBlock->fillLevel = 0;
-                    _r.ending = true;
+                    usleep( 1000 );
+                }
+
+                if ( ( !_r.options->file ) && ( !_queueBlock( &_r, false ) ) )
+                {
+                    if ( _r.options->sampleDuration )
+                    {
+                        genericsReport( V_WARN, "Capture buffer full after %u ms: stopping capture and decoding what was received" EOL,
+                                        _r.sampling ? genericsTimestampmS() - _r.starttime : 0 );
+                        rxBlock->fillLevel = 0;
+                        _r.ending = true;
+                    }
+                    else
+                    {
+                        /* Running until stopped: discard this block and carry on. The decoder */
+                        /* finds its place again at the next sync in the trace.                 */
+                        _r.droppedBytes += rxBlock->fillLevel;
+                        rxBlock->fillLevel = 0;
+                        _r.resync = true;
+                    }
                 }
             }
 
             /* Stop once the sample interval is over */
-            if ( ( ( volatile bool ) _r.sampling ) && ( ( genericsTimestampmS() - ( volatile uint32_t )_r.starttime ) > _r.options->sampleDuration ) )
+            if ( ( _r.options->sampleDuration ) && ( ( volatile bool ) _r.sampling ) &&
+                    ( ( genericsTimestampmS() - ( volatile uint32_t )_r.starttime ) > ( uint32_t )_r.options->sampleDuration ) )
             {
                 _r.ending = true;
             }
@@ -1527,9 +1660,20 @@ int main( int argc, char *argv[] )
         pthread_join( _r.processThread, NULL );
     }
 
+    if ( _r.liveUpdates )
+    {
+        genericsFPrintf( stderr, EOL );
+    }
+
     /* Data are collected, now process and report */
     genericsReport( V_INFO, "Received %d raw sample bytes, %ld function changes, %ld distinct addresses" EOL,
                     _r.intervalBytes, HASH_COUNT( _r.subhead ), HASH_COUNT( _r.insthead ) );
+
+    if ( _r.droppedBytes )
+    {
+        genericsReport( V_WARN, "%.1f MB of trace discarded because decoding could not keep up: code that ran in those "
+                        "parts can show as not run, and call costs are approximate" EOL, ( double )_r.droppedBytes / 1e6 );
+    }
 
     if ( _lostInstructions )
     {
@@ -1545,12 +1689,18 @@ int main( int argc, char *argv[] )
     /* Coverage only needs executed instructions, so it doesn't depend on calls being seen */
     if ( _r.options->lcovfile )
     {
+        struct coverageTotals t;
+
         if ( ( HASH_COUNT( _r.insthead ) ) &&
                 ( ext_ff_outputLcov( _r.options->lcovfile,
                                      _r.options->truncateDeleteMaterial ? _r.options->deleteMaterial : NULL,
-                                     _r.insthead, _r.s ) ) )
+                                     _r.insthead, _r.s, &t ) ) )
         {
             genericsReport( V_INFO, "Output Coverage" EOL );
+            genericsReport( V_WARN, "Coverage: lines %u/%u (%.1f%%), functions %u/%u (%.1f%%), branches %u/%u (%.1f%%)" EOL,
+                            t.linesHit, t.lines, _pct( t.linesHit, t.lines ),
+                            t.functionsHit, t.functions, _pct( t.functionsHit, t.functions ),
+                            t.branchesHit, t.branches, _pct( t.branchesHit, t.branches ) );
         }
         else
         {

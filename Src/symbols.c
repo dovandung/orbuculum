@@ -709,8 +709,11 @@ static enum symbolErr _getTargetProgramInfo( struct SymbolSet *s )
                         break;
 
                     case LT_ASSEMBLY: /* --------------------------------------------------- */
-                        /* This happens when there is no corresponding source code */
+                        /* This happens when there is no source text: the file wasn't found, or objdump  */
+                        /* has shown this line before (a loop, or code after a nested block). The line  */
+                        /* number from the file:line marker still applies.                               */
                         sourceEntry = _AddSourceLineEntry( s );
+                        sourceEntry->lineNo = lineNo;
                         sourceEntry->functionIdx = functionEntryIdx;
                         sourceEntry->fileIdx = fileEntryIdx;
                         startAddrSet = false;

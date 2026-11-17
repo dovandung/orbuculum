@@ -7,6 +7,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "ext_fileformats.h"
 
 #define HANDLE_MASK         (0xFFFFFF)   /* cachegrind cannot cope with large file handle numbers */
@@ -427,10 +428,11 @@ static int _cov_sort_fn( const void *a, const void *b )
     return ( x->addr < y->addr ) ? -1 : ( x->addr > y->addr );
 }
 // ====================================================================================================
-bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss )
+bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss, struct coverageTotals *totals )
 
 /* Output an lcov tracefile (line, function and branch coverage) for genhtml and friends. Every   */
 /* instruction of the program comes from the symbol set, so code that never ran is reported too. */
+/* The totals are returned in totals, if given.                                                   */
 
 {
     struct execEntryHash *h;
@@ -443,6 +445,11 @@ bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHa
     if ( !lcovfile )
     {
         return false;
+    }
+
+    if ( totals )
+    {
+        memset( totals, 0, sizeof( *totals ) );
     }
 
     /* A sort elsewhere may have left the head pointer we were given mid-list: find the real head */
@@ -550,6 +557,12 @@ bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHa
 
         fprintf( c, "FNF:%u\nFNH:%u\n", fnf, fnh );
 
+        if ( totals )
+        {
+            totals->functions    += fnf;
+            totals->functionsHit += fnh;
+        }
+
         /* Branches: each conditional jump is a block with two outcomes, jumped and fell through */
         uint32_t brf = 0, brh = 0, block = 0;
 
@@ -580,6 +593,12 @@ bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHa
             fprintf( c, "BRF:%u\nBRH:%u\n", brf, brh );
         }
 
+        if ( totals )
+        {
+            totals->branches    += brf;
+            totals->branchesHit += brh;
+        }
+
         /* Lines: hits are the most any instruction of the line ran */
         uint32_t lf = 0, lh = 0;
         uint32_t j = i;
@@ -601,6 +620,12 @@ bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHa
         }
 
         fprintf( c, "LF:%u\nLH:%u\nend_of_record\n", lf, lh );
+
+        if ( totals )
+        {
+            totals->lines    += lf;
+            totals->linesHit += lh;
+        }
         i = end;
     }
 

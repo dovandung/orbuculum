@@ -93,7 +93,15 @@ struct subcall
 bool ext_ff_outputDot( char *dotfile, struct subcall *subcallList, struct SymbolSet *ss );
 bool ext_ff_outputProfile( char *profile, char *elffile, char *deleteMaterial, bool includeVisits, uint64_t timelen,
                            struct execEntryHash *insthead, struct subcall *subcallList, struct SymbolSet *ss );
-bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss );
+/* Coverage totals, filled in by ext_ff_outputLcov */
+struct coverageTotals
+{
+    uint32_t lines, linesHit;
+    uint32_t functions, functionsHit;
+    uint32_t branches, branchesHit;
+};
+
+bool ext_ff_outputLcov( char *lcovfile, char *deleteMaterial, struct execEntryHash *insthead, struct SymbolSet *ss, struct coverageTotals *totals );
 // ====================================================================================================
 
 #ifdef __cplusplus
