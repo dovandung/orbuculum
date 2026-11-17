@@ -1,0 +1,55 @@
+name: Release Windows binaries
+
+# Copies the orbuculum-win64 artifact of the latest successful "Build Windows binaries" run on main
+# (or of the run given) into a GitHub release, as one zip. Start it by hand: Actions tab -> Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag and name of the release, e.g. v2.3.0-20261117'
+        required: true
+      run_id:
+        description: 'Build run to take the artifact from (empty: latest successful build of main)'
+        required: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      RUN_ID: ${{ inputs.run_id }}
+    steps:
+      - name: Find the build
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh api "repos/$GH_REPO/actions/workflows/build-windows.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
+          fi
+          SHA=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq '.head_sha')
+          [ -n "$RUN_ID" ] && [ -n "$SHA" ] || { echo "::error::no build found"; exit 1; }
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+          echo "Build run $RUN_ID, commit $SHA"
+      - name: Download the artifact
+        run: gh run download "$RUN_ID" -n orbuculum-win64 -D orbuculum-win64
+      - name: Zip it
+        run: |
+          ls -R orbuculum-win64 | head -60
+          zip -r -q "orbuculum-win64-$TAG.zip" orbuculum-win64
+          ls -la *.zip
+      - name: Create the release
+        run: |
+          {
+            echo "Windows x64 build of commit ${SHA} (build run ${RUN_ID})."
+            echo
+            echo "Unpack the whole zip into an empty folder; the tools are in \`bin\` with the DLLs they need."
+            echo "The tools that read an ELF file also need \`arm-none-eabi-objdump\` on the PATH (or named by \`OBJDUMP\`)."
+            echo
+            echo "Changes are listed in CHANGES.md."
+          } > notes.md
+          gh release create "$TAG" "orbuculum-win64-$TAG.zip" --target "$SHA" --title "Orbuculum $TAG (Windows x64)" --notes-file notes.md
