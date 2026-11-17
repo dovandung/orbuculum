@@ -173,6 +173,7 @@ struct RunTime
     uint64_t timelineEvents;                    /* Calls written to the timeline */
     uint64_t timelineSkipped;                   /* Calls left out (too short, or the file limit was reached) */
     uint32_t rootFn;                            /* Function running with no call open (main, usually), or NO_FUNCTION */
+    int timeBase;                               /* Timeline clock: 0 not decided yet, 1 instructions, 2 cycles */
     uint64_t rootStart;                         /* ...and when it started, or when the last one ended */
     uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
     volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
@@ -227,12 +228,32 @@ static inline bool _changed( struct TRACECPUState *cpu, enum TRACEchanges c )
     return r;
 }
 // ====================================================================================================
-static uint64_t _timelineNow( struct RunTime *r )
+static bool _timelineInCycles( struct RunTime *r )
 
-/* Timeline time: cycles if the trace is cycle accurate, otherwise instructions executed */
+/* Timeline clock: cycles if the trace is cycle accurate, otherwise instructions executed.   */
+/* Cycle accurate trace gives cycles for every instruction from the start, so decide once,   */
+/* early on: a stray cycle count from damaged trace must not change the clock half way.      */
 
 {
-    return r->cyclesExecuted ? r->cyclesExecuted : r->instExecuted;
+    if ( !r->timeBase )
+    {
+        bool cyc = ( r->cyclesExecuted ) && ( r->cyclesExecuted >= r->instExecuted );
+
+        if ( r->instExecuted < 1024 )
+        {
+            return cyc;
+        }
+
+        r->timeBase = cyc ? 2 : 1;
+    }
+
+    return r->timeBase == 2;
+}
+// ====================================================================================================
+static uint64_t _timelineNow( struct RunTime *r )
+
+{
+    return _timelineInCycles( r ) ? r->cyclesExecuted : r->instExecuted;
 }
 // ====================================================================================================
 static void _jsonString( const char *in, char *out, size_t outLen )
@@ -263,7 +284,7 @@ static void _timelineCall( struct RunTime *r, struct _subcallAccount *a )
     struct nameEntry n;
     char name[256];
     const char *f;
-    uint64_t start = r->cyclesExecuted ? a->inCycles : a->inTicks;
+    uint64_t start = _timelineInCycles( r ) ? a->inCycles : a->inTicks;
     uint64_t dur   = _timelineNow( r ) - start;
 
     if ( !r->timeline )
@@ -2002,11 +2023,11 @@ int main( int argc, char *argv[] )
 
         _jsonString( pn, pname, sizeof( pname ) );
         fprintf( _r.timeline, "%s{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"%s (time in %s)\"}}\n]}\n",
-                 _r.timelineEvents ? ",\n" : "", pname, _r.cyclesExecuted ? "cycles" : "instructions" );
+                 _r.timelineEvents ? ",\n" : "", pname, _timelineInCycles( &_r ) ? "cycles" : "instructions" );
         fclose( _r.timeline );
         _r.timeline = NULL;
         genericsReport( V_WARN, "Timeline: %" PRIu64 " calls written, %" PRIu64 " left out (time in %s)" EOL, _r.timelineEvents, _r.timelineSkipped,
-                        _r.cyclesExecuted ? "cycles" : "instructions" );
+                        _timelineInCycles( &_r ) ? "cycles" : "instructions" );
     }
 
     /* Data are collected, now process and report */
