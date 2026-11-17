@@ -1,4 +1,5 @@
 Version 2.3.0 In progress
+* Update the bundled libdwarf from 0.7.0 to 2.3.3 (the three local patches are no longer needed)
 * orbprofile: count conditional jumps (B<c>, CBZ, CBNZ) taken vs. fell through, written as KCacheGrind 'jcnd=' lines
 * orbprofile: ETM4 (-P ETM4, Cortex-M7): an atom is a run of instructions up to a branch, with exceptions, indirect branches and return stack compression
 * orbprofile: -c/--coverage-file writes an lcov tracefile with line, function and branch coverage (genhtml, VS Code Coverage Gutters)
