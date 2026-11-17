@@ -433,6 +433,27 @@ static bool _resolveWatches( void )
     return true;
 }
 // ====================================================================================================
+static bool _isIdentifier( const char *n )
+
+/* A plain C name (not an address, not a name with a scope or a member) */
+
+{
+    if ( ( !isalpha( ( unsigned char )*n ) ) && ( *n != '_' ) )
+    {
+        return false;
+    }
+
+    for ( ; *n; n++ )
+    {
+        if ( ( !isalnum( ( unsigned char )*n ) ) && ( *n != '_' ) )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+// ====================================================================================================
 static void _printSetup( void )
 
 /* The register writes that make comparator n report accesses to watch n */
@@ -464,6 +485,17 @@ static void _printSetup( void )
 
     printf( "%s Data trace setup for orbdata (Cortex-M3/M4/M7). Run it after the trace port (SWO or\n", cmt );
     printf( "%s parallel trace) is on. Comparator n watches the n'th -w given to orbdata.\n", cmt );
+
+    if ( options.setup == SETUP_C )
+    {
+        printf( "%s Variables given by name are written as &name, so the code stays right when the\n", cmt );
+        printf( "%s firmware is rebuilt; put it where they are visible (a static one: in its own file).\n", cmt );
+    }
+    else
+    {
+        printf( "%s The addresses are from this build of the ELF file: print the setup again after a rebuild.\n", cmt );
+    }
+
     OR( DEMCR, 0x01000000u, "DEMCR.TRCENA: DWT and ITM on" );
     WR( ITM_LAR, 0xC5ACCE55u, "unlock the ITM" );
     OR( ITM_TCR, 0x00000009u, "ITM enable, and pass DWT packets on (TXENA)" );
@@ -476,7 +508,17 @@ static void _printSetup( void )
 
         WR( DWT_FUNCTION( i ), 0u, "comparator off while it is changed" );
         snprintf( text, sizeof( text ), "comparator %d: address of %s", i, w->name );
-        WR( DWT_COMP( i ), w->addr & ~( ( 1u << mask ) - 1 ), text );
+
+        if ( ( options.setup == SETUP_C ) && _isIdentifier( w->name ) )
+        {
+            /* In firmware take the address from the linker: it can move at every build */
+            printf( "*(volatile unsigned int *)0x%08X = (unsigned int)&%s & ~0x%Xu;   %s %s\n", DWT_COMP( i ), w->name, ( 1u << mask ) - 1, cmt, text );
+        }
+        else
+        {
+            WR( DWT_COMP( i ), w->addr & ~( ( 1u << mask ) - 1 ), text );
+        }
+
         snprintf( text, sizeof( text ), "%u byte%s", w->size, ( w->size > 1 ) ? "s" : "" );
         WR( DWT_MASK( i ), mask, text );
         snprintf( text, sizeof( text ), "send the %svalue on %s", options.withPC ? "PC and the " : "",
