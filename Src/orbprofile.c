@@ -51,6 +51,9 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 /* Instructions skipped because the trace position wasn't known (e.g. after an indirect branch) */
 static uint64_t _lostInstructions;
 
+/* ETM4: most instructions run between two atoms (branches) before giving up on the position */
+#define ETM4_MAX_RUN (0x10000)
+
 struct _subcallAccount
 {
     struct subcallSig sig;
@@ -114,6 +117,12 @@ struct opConstruct
 
     bool isExceptReturn;                 /* Is this flagged as an exception return? */
     bool isException;                    /* Is this flagged as an exception? */
+
+    /* ETM4 only */
+    bool etm4Pending;                    /* A taken indirect branch (op.h) is waiting for its destination */
+    bool etm4ExPending;                  /* An exception was taken, waiting for the handler address */
+    bool etm4ExReturn;                   /* An exception return element was seen */
+    uint32_t etm4ExRetAddr;              /* Where the pending exception will return to */
 };
 
 /* A block of received data */
@@ -369,6 +378,8 @@ static bool _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
     ( *h )->functionindex = n.functionindex;
     ( *h )->isJump        = n.assy[n.assyLine].isJump;
     ( *h )->isCondJump    = n.assy[n.assyLine].isCondJump;
+    ( *h )->isP0          = n.assy[n.assyLine].etm4branch;
+    ( *h )->p0Sequential  = n.assy[n.assyLine].etm4seq;
     ( *h )->isSubCall     = n.assy[n.assyLine].isSubCall;
     ( *h )->isReturn      = n.assy[n.assyLine].isReturn;
     ( *h )->jumpdest      = n.assy[n.assyLine].jumpdest;
@@ -530,6 +541,196 @@ static uint32_t _atomCycles( struct RunTime *r, uint32_t *budget )
     return c;
 }
 // ====================================================================================================
+static bool _etm4Known( struct RunTime *r, struct execEntryHash **h )
+
+/* ETM4: is the current position known, and if so its record */
+
+{
+    return ( ( r->op.workingAddr & SPECIALS_MASK ) != SPECIALS_MASK ) && _hashFindOrCreate( r, r->op.workingAddr, h );
+}
+// ====================================================================================================
+static uint32_t _etm4Resolve( struct RunTime *r, uint32_t dest )
+
+/* ETM4: the taken indirect branch in op.h went to dest (NO_DESTADDRESS if the trace didn't say). */
+/* Account the call or return it made. Returns the address a closed call returns to, or 0.        */
+
+{
+    uint32_t popped = 0;
+
+    r->op.etm4Pending = false;
+    r->op.workingAddr = dest;
+
+    if ( ( r->op.h ) && ( r->op.h->isReturn ) )
+    {
+        /* With no destination this closes the innermost call, and where that returns to is where we are */
+        popped = _returnEvent( r, dest, false );
+
+        if ( ( ( dest & SPECIALS_MASK ) == SPECIALS_MASK ) && ( popped ) )
+        {
+            r->op.workingAddr = popped;
+        }
+    }
+    else if ( ( r->op.h ) && ( r->op.h->isSubCall ) && ( ( dest & SPECIALS_MASK ) != SPECIALS_MASK ) )
+    {
+        _callEvent( r, r->op.h->addr + ( ( r->op.h->is4Byte ) ? 4 : 2 ), dest );
+    }
+
+    return popped;
+}
+// ====================================================================================================
+static void _etm4Atom( struct RunTime *r, bool taken )
+
+/* ETM4: one atom. Every instruction up to the next P0 element (branch, ISB, WFI, WFE) executed, */
+/* and the atom says if that one did (for a conditional branch: if it was taken).               */
+
+{
+    struct execEntryHash *h;
+
+    if ( r->op.etm4Pending )
+    {
+        /* The last indirect branch's destination never came (e.g. return stack compression) */
+        _etm4Resolve( r, NO_DESTADDRESS );
+    }
+
+    for ( uint32_t steps = 0; steps < ETM4_MAX_RUN; steps++ )
+    {
+        if ( !_etm4Known( r, &h ) )
+        {
+            /* Position unknown: lost until the next address from the trace */
+            _lostInstructions++;
+            r->op.workingAddr = NO_DESTADDRESS;
+            return;
+        }
+
+        if ( !h->isP0 )
+        {
+            /* Executed, and not a branch (as 'not actioned' it can't move anywhere but on, which */
+            /* matters for SVC and UDF, encoded like conditional branches)                         */
+            _handleInstruction( r, false, 0 );
+            continue;
+        }
+
+        /* This atom's instruction. Cycle count packets come with P0 elements, so it gets the cycles */
+        uint32_t zero = 0;
+        _handleInstruction( r, taken, _atomCycles( r, &zero ) );
+
+        if ( ( taken ) && ( !h->p0Sequential ) )
+        {
+            if ( ( ( h->isJump ) || ( h->isSubCall ) ) && ( ( h->jumpdest & SPECIALS_MASK ) != SPECIALS_MASK ) )
+            {
+                /* Direct branch: _handleInstruction moved to its destination */
+                _checkJumps( r, true );
+            }
+            else
+            {
+                /* Indirect branch: the destination comes in an address packet */
+                r->op.workingAddr = NO_DESTADDRESS;
+                r->op.etm4Pending = true;
+            }
+        }
+
+        return;
+    }
+
+    /* No branch in a very long run: the position is wrong */
+    r->op.workingAddr = NO_DESTADDRESS;
+}
+// ====================================================================================================
+static void _etm4Exception( struct RunTime *r, uint32_t retAddr )
+
+/* ETM4: an exception was taken, with this preferred return address. Everything from the position */
+/* up to (not including) the return address executed. The handler address comes next.            */
+
+{
+    struct execEntryHash *h;
+
+    if ( r->op.etm4Pending )
+    {
+        /* The last indirect branch's destination wasn't in the trace. A return's comes from the */
+        /* call stack (its code may have run before the exception). Otherwise the exception was  */
+        /* taken before the first instruction there, so it is the return address.               */
+        _etm4Resolve( r, ( ( r->op.h ) && ( r->op.h->isReturn ) ) ? NO_DESTADDRESS : retAddr );
+    }
+
+    if ( ( ( r->op.workingAddr & SPECIALS_MASK ) != SPECIALS_MASK ) && ( retAddr > r->op.workingAddr ) &&
+            ( retAddr - r->op.workingAddr < ETM4_MAX_RUN ) )
+    {
+        while ( ( r->op.workingAddr < retAddr ) && ( _etm4Known( r, &h ) ) && ( !h->isP0 ) )
+        {
+            _handleInstruction( r, false, 0 );
+        }
+    }
+
+    r->op.workingAddr   = retAddr;
+    r->op.etm4ExPending = true;
+    r->op.etm4ExRetAddr = retAddr;
+}
+// ====================================================================================================
+static void _etm4CB( struct RunTime *r, struct TRACECPUState *cpu )
+
+/* ETM4 trace callback. Unlike ETM3.5 an atom is not one instruction but a run of instructions up */
+/* to a branch, and addresses come after the branch they belong to, so nothing is deferred.       */
+
+{
+    if ( TRACEStateChanged( &r->i, EV_CH_EXRETURN ) )
+    {
+        r->op.etm4ExReturn = true;
+    }
+
+    if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
+    {
+        if ( TRACEStateChanged( &r->i, EV_CH_EX_ENTRY ) )
+        {
+            /* Exception packet: this is the address it returns to */
+            DBG_OUT( "EXCEPTION, returns to %08x" EOL, cpu->addr );
+            _etm4Exception( r, cpu->addr );
+        }
+        else if ( r->op.etm4ExPending )
+        {
+            /* Start of the exception handler: a call from where it returns to */
+            DBG_OUT( "HANDLER %08x" EOL, cpu->addr );
+            r->op.etm4ExPending = false;
+            _callEvent( r, r->op.etm4ExRetAddr, cpu->addr );
+            r->op.workingAddr = cpu->addr;
+        }
+        else
+        {
+            uint32_t popped = 0;
+
+            if ( r->op.etm4Pending )
+            {
+                /* Destination of the last indirect branch */
+                popped = _etm4Resolve( r, cpu->addr );
+            }
+
+            if ( ( r->op.etm4ExReturn ) && ( !popped ) )
+            {
+                /* Exception return without a return instruction seen: close the exception's call */
+                _returnEvent( r, cpu->addr, true );
+            }
+
+            r->op.workingAddr = cpu->addr;
+            DBG_OUT( "A:%08x" EOL, cpu->addr );
+        }
+
+        r->op.etm4ExReturn = false;
+    }
+
+    if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
+    {
+        uint32_t n = cpu->eatoms + cpu->natoms;
+        uint32_t disposition = cpu->disposition;
+
+        DBG_OUT( "E:%d N:%d" EOL, cpu->eatoms, cpu->natoms );
+
+        while ( n-- )
+        {
+            _etm4Atom( r, disposition & 1 );
+            disposition >>= 1;
+        }
+    }
+}
+// ====================================================================================================
 static void _traceCB( void *d )
 
 /* Callback function for when valid TRACE decode is detected */
@@ -581,6 +782,16 @@ static void _traceCB( void *d )
     {
         r->pendingCycles += cpu->cycleCount;
         r->packetCycles  += cpu->cycleCount;
+    }
+
+    if ( r->options->tProtocol == TRACE_PROT_ETM4 )
+    {
+        if ( r->sampling )
+        {
+            _etm4CB( r, cpu );
+        }
+
+        return;
     }
 
     if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )

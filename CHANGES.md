@@ -1,5 +1,6 @@
 Version 2.3.0 In progress
 * orbprofile: count conditional jumps (B<c>, CBZ, CBNZ) taken vs. fell through, written as KCacheGrind 'jcnd=' lines
+* orbprofile: ETM4 (-P ETM4, Cortex-M7): an atom is a run of instructions up to a branch, with exceptions, indirect branches and return stack compression
 * orbprofile: -c/--coverage-file writes an lcov tracefile with line, function and branch coverage (genhtml, VS Code Coverage Gutters)
 * Add Support/orb2lcov.py to make the same lcov coverage from saved orbprofile KCacheGrind files, and to merge several runs
 * Modify orblcd to receive shorter messages than word-length (if appropriate)

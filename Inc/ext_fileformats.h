@@ -37,6 +37,8 @@ struct execEntryHash
     /* Details about this instruction */
     bool     isJump;                     /* Flag if this is a jump instruction */
     bool     isCondJump;                 /* Flag if this is a conditional jump (B<c>, CBZ, CBNZ) */
+    bool     isP0;                       /* ETM4: gets an atom (a branch, ISB, WFI or WFE) */
+    bool     p0Sequential;               /* ETM4: ...that carries on with the next instruction (ISB, WFI, WFE) */
     bool     is4Byte;                    /* Flag for 4 byte instruction */
     bool     isSubCall;                  /* Flag for subroutine call (BL/BLX) */
     bool     isReturn;                   /* Flag for return */

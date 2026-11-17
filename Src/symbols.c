@@ -313,6 +313,127 @@ static enum LineType _getLineType( char *sourceLine, char *p1, char *p2, char *p
     return LT_NOISE;
 }
 // ====================================================================================================
+static bool _withCond( const char *m, const char *base )
+
+/* Is mnemonic m the base mnemonic, optionally with a condition code suffix (as in an IT block)? */
+
+{
+    static const char *const conds[] = { "", "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc",
+                                         "hi", "ls", "ge", "lt", "gt", "le", "al", NULL
+                                       };
+    size_t l = strlen( base );
+
+    if ( strncmp( m, base, l ) )
+    {
+        return false;
+    }
+
+    for ( int i = 0; conds[i]; i++ )
+    {
+        if ( !strcmp( m + l, conds[i] ) )
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+// ====================================================================================================
+static bool _etm4P0( const char *assy, bool *sequential )
+
+/* Is this instruction a P0 element for ETMv4, i.e. does it get an atom (ARM IHI0064H.a F1.3)? */
+/* Those are the branches (direct and indirect, including writes to the PC) and ISB, WFI and   */
+/* WFE. For the last three 'sequential' is set: execution carries on with the next one.       */
+
+{
+    char m[16];
+    char op1[8];
+    const char *p = assy;
+    int i = 0;
+
+    *sequential = false;
+
+    if ( !p )
+    {
+        return false;
+    }
+
+    /* Mnemonic, lower case, without the .n / .w width qualifier */
+    while ( ( *p ) && ( !isspace( ( unsigned char )*p ) ) && ( i < ( int )sizeof( m ) - 1 ) )
+    {
+        m[i++] = tolower( ( unsigned char ) * p++ );
+    }
+
+    m[i] = 0;
+
+    char *dot = strchr( m, '.' );
+
+    if ( dot )
+    {
+        *dot = 0;
+    }
+
+    /* First operand */
+    while ( ( *p ) && ( isspace( ( unsigned char )*p ) ) )
+    {
+        p++;
+    }
+
+    const char *ops = p;
+    i = 0;
+
+    while ( ( *p ) && ( *p != ',' ) && ( !isspace( ( unsigned char )*p ) ) && ( i < ( int )sizeof( op1 ) - 1 ) )
+    {
+        op1[i++] = tolower( ( unsigned char ) * p++ );
+    }
+
+    op1[i] = 0;
+
+    /* Branches */
+    if ( _withCond( m, "b" ) || _withCond( m, "bl" ) || _withCond( m, "blx" ) || _withCond( m, "bx" ) ||
+            _withCond( m, "bxj" ) || _withCond( m, "bxns" ) || _withCond( m, "blxns" ) ||
+            ( !strcmp( m, "cbz" ) ) || ( !strcmp( m, "cbnz" ) ) || _withCond( m, "tbb" ) || _withCond( m, "tbh" ) )
+    {
+        return true;
+    }
+
+    /* Barrier and waits */
+    if ( _withCond( m, "isb" ) || _withCond( m, "wfi" ) || _withCond( m, "wfe" ) )
+    {
+        *sequential = true;
+        return true;
+    }
+
+    /* Register lists loading the PC */
+    if ( ( !strncmp( m, "pop", 3 ) ) || ( !strncmp( m, "ldm", 3 ) ) )
+    {
+        const char *b = strchr( ops, '{' );
+
+        while ( ( b ) && ( *b ) && ( *b != '}' ) )
+        {
+            if ( ( ( b[0] == '{' ) || ( b[0] == ' ' ) || ( b[0] == ',' ) ) &&
+                    ( tolower( ( unsigned char )b[1] ) == 'p' ) && ( tolower( ( unsigned char )b[2] ) == 'c' ) &&
+                    ( ( b[3] == '}' ) || ( b[3] == ',' ) ) )
+            {
+                return true;
+            }
+
+            b++;
+        }
+
+        return false;
+    }
+
+    /* Other writes to the PC */
+    if ( ( ( !strncmp( m, "ldr", 3 ) ) || ( !strncmp( m, "mov", 3 ) ) || ( !strncmp( m, "add", 3 ) ) || ( !strncmp( m, "sub", 3 ) ) ) &&
+            ( !strcmp( op1, "pc" ) ) )
+    {
+        return true;
+    }
+
+    return false;
+}
+// ====================================================================================================
 static bool _getDest( char *assy, uint32_t *dest )
 
 /* Return destination address if this assembly instruction is a precomputed jump */
@@ -719,25 +840,8 @@ static enum symbolErr _getTargetProgramInfo( struct SymbolSet *s )
 
                             /* For ETM4 we need to know direct and indirect branches, cos they are the only instructions                */
                             /* that will get traced. So let's label those...Per definition in ARM IHI0064H.a ID20820 Appendix F         */
-                            if (
-                                        MASKED_COMPARE( 0xffffff03, 0x00004700 ) || /* BL, BLX rx */
-                                        MASKED_COMPARE( 0xfffff500, 0x0000b100 ) || /* CBNZ/CBZ   */
-                                        MASKED_COMPARE( 0xfffff000, 0x0000d000 ) || /* B          */
-                                        MASKED_COMPARE( 0xffffffef, 0x0000bf20 ) || /* WFE/WFI    */
-
-                                        /* 32 bit matches */
-                                        MASKED_COMPARE( 0xffd08000, 0xe8908000 ) || /* LDM */
-                                        MASKED_COMPARE( 0xffd08000, 0xe9908000 ) || /* LDMDB */
-                                        MASKED_COMPARE( 0xfe10f000, 0xf810f000 ) || /* LDR to PC */
-                                        MASKED_COMPARE( 0xf8008000, 0xf0008000 )  /* Branches and misc control */
-                            )
-                            {
-                                sourceEntry->assy[sourceEntry->assyLines].etm4branch = true;
-                            }
-                            else
-                            {
-                                sourceEntry->assy[sourceEntry->assyLines].etm4branch = false;
-                            }
+                            sourceEntry->assy[sourceEntry->assyLines].etm4branch =
+                                        _etm4P0( sourceEntry->assy[sourceEntry->assyLines].assy, &sourceEntry->assy[sourceEntry->assyLines].etm4seq );
 
                             /* The only way a subroutine will be called from gcc (See gcc source code file gcc/config/arm/thumb2.md) is */
                             /* via blx reg, blxns reg. In theory it could also be done via direct manipulation of R15, but fortunately  */
