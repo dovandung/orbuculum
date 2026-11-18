@@ -29,7 +29,7 @@ pins, and connect the two:
 1. **Terminal > Run Task > Trace: start (probe + hub)**.
 2. Run **Trace: history (orbmortem)**. It shows nothing while the program runs.
 3. Start debugging (F5) with an "Attach + trace" configuration.
-4. When the program stops at a breakpoint, the orbmortem panel shows the instructions that led
+4. When the program stops at a breakpoint (after the firmware has switched trace on), the orbmortem panel shows the instructions that led
    there, and the debug console prints the last ten source lines (`trace-auto 10`). Type
    `trace-back 50` or `trace-calls` in the debug console for more. The `file:line` texts are links.
 5. For coverage, run **Trace: live coverage** instead of orbmortem, click **Watch** in the status

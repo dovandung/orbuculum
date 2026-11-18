@@ -48,7 +48,7 @@
             // O on a line opens that source line in the editor.
             "label": "Trace: history (orbmortem)",
             "type": "shell",
-            "command": "& \"$env:ORB_BIN/orbmortem.exe\" -e '${input:elf}' -P ETM3.5 -j '${workspaceFolder}/trace.journal' -C 'code -g %f:%l'",
+            "command": "& \"$env:ORB_BIN/orbmortem.exe\" -e '${input:elf}' -P ETM3.5 -r -j '${workspaceFolder}/trace.journal' -C 'code -g %f:%l'",
             "isBackground": true,
             "problemMatcher": [],
             "presentation": { "panel": "dedicated", "reveal": "always", "focus": true }

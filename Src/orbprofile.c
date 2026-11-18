@@ -27,6 +27,10 @@
 #include "ext_fileformats.h"
 #include "stream.h"
 
+#ifdef WIN32
+    #include <windows.h>
+#endif
+
 #define TICK_TIME_MS        (1)          /* Time intervals for checks */
 #define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
 #define LIVE_MIN_INTERVAL_MS (200)       /* Fastest live update, in mS */
@@ -37,8 +41,9 @@ enum Prot { PROT_OFLOW, PROT_ETM, PROT_UNKNOWN };
 const char *protString[] = {"OFLOW", "ETM", NULL};
 
 /* How many transfer buffers from the source to allocate */
-#define DEFAULT_BUFFER_MB (256)          /* Default capture buffer size, can be changed with -b */
+#define DEFAULT_BUFFER_MB (1024)         /* Default capture buffer size, can be changed with -b */
 #define MIN_RAW_BLOCKS (4)
+#define SPARE_BLOCKS (8)                  /* Emptied capture buffers kept for reuse, the rest are freed */
 
 /* Direct-mapped cache in front of the instruction hash table (decoding looks up every instruction) */
 #define ICACHE_BITS (16)
@@ -191,7 +196,10 @@ struct RunTime
     /* Ring buffer for samples ... this 'pads' the rate data arrive and how fast they can be processed */
     int wp;                                     /* Read and write pointers into transfer buffers */
     int rp;
-    struct dataBlock *rawBlock;                 /* Transfer buffers from the receiver (allocated, -b) */
+    struct dataBlock **rawBlock;                /* Transfer buffers from the receiver: slots for up to -b of them. */
+    /* A buffer is only allocated while it holds data waiting to be decoded */
+    struct dataBlock *spareBlock[SPARE_BLOCKS]; /* Decoded buffers kept for reuse */
+    int numSpare;
     int numBlocks;                              /* Number of transfer buffers */
 
     /* Instruction lookup cache: addresses and records, indexed by (addr >> 1) */
@@ -1222,8 +1230,9 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -E, --eof:          When reading from file, terminate at EOF" EOL );
     genericsFPrintf( stderr, "    -f, --input-file:   Take input from specified file" EOL );
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
-    genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Capture buffer size (default %d). Decoding is slower than a fast" EOL, DEFAULT_BUFFER_MB );
-    genericsFPrintf( stderr, "                        CPU makes ETM data, so this sets how long a capture can be" EOL );
+    genericsFPrintf( stderr, "    -b, --buffer-size:  <MiB> Most memory for trace waiting to be decoded (default %d). Decoding" EOL, DEFAULT_BUFFER_MB );
+    genericsFPrintf( stderr, "                        can be slower than a fast CPU makes ETM data, so this sets how long a" EOL );
+    genericsFPrintf( stderr, "                        capture can be. Memory is only used while there is a backlog" EOL );
     genericsFPrintf( stderr, "    -c, --coverage-file: <Filename> lcov tracefile for line, function and branch coverage" EOL );
     genericsFPrintf( stderr, "    -g, --timeline-file: <Filename> timeline of function calls and exceptions (Chrome trace JSON," EOL );
     genericsFPrintf( stderr, "                        for ui.perfetto.dev or chrome://tracing). Time is in instructions," EOL );
@@ -1615,6 +1624,31 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     }
 }
 // ====================================================================================================
+static struct dataBlock _lastResort;            /* For the closing blocks if there is no memory left */
+
+static struct dataBlock *_allocBlock( void )
+
+/* Memory for one capture buffer, taken from and given back to the system directly so that */
+/* what a backlog needed is returned once it has been decoded.                              */
+
+{
+#ifdef WIN32
+    return ( struct dataBlock * )VirtualAlloc( NULL, sizeof( struct dataBlock ), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+#else
+    return ( struct dataBlock * )malloc( sizeof( struct dataBlock ) );
+#endif
+}
+// ====================================================================================================
+static void _freeBlock( struct dataBlock *b )
+
+{
+#ifdef WIN32
+    VirtualFree( b, 0, MEM_RELEASE );
+#else
+    free( b );
+#endif
+}
+// ====================================================================================================
 static bool _queueBlock( struct RunTime *r, bool force )
 
 /* Hand the block at wp (already filled in) to the processing thread and start a new, empty one. */
@@ -1622,6 +1656,8 @@ static bool _queueBlock( struct RunTime *r, bool force )
 /* Returns false if the buffer is full (decoding has fallen too far behind).                     */
 
 {
+    struct dataBlock *nb;
+
     pthread_mutex_lock( &r->dataForClients_m );
     int nwp = ( r->wp + 1 ) % r->numBlocks;
 
@@ -1631,8 +1667,24 @@ static bool _queueBlock( struct RunTime *r, bool force )
         return false;
     }
 
+    /* Memory for the next block: one just emptied by the decoder if there is one, so that a  */
+    /* capture the decoder keeps up with stays in the same few buffers, however large -b is.  */
+    nb = r->numSpare ? r->spareBlock[--r->numSpare] : _allocBlock();
+
+    if ( !nb )
+    {
+        if ( !force )
+        {
+            pthread_mutex_unlock( &r->dataForClients_m );
+            return false;
+        }
+
+        nb = &_lastResort;
+    }
+
+    nb->fillLevel = 0;
+    r->rawBlock[nwp] = nb;
     r->wp = nwp;
-    r->rawBlock[r->wp].fillLevel = 0;
     pthread_cond_signal( &r->dataForClients );
     pthread_mutex_unlock( &r->dataForClients_m );
     return true;
@@ -1714,7 +1766,7 @@ static void *_processBlocks( void *params )
 
         pthread_mutex_unlock( &r->dataForClients_m );
 
-        struct dataBlock *b = &r->rawBlock[r->rp];
+        struct dataBlock *b = r->rawBlock[r->rp];
         genericsReport( V_DEBUG, "RXED Packet of %d bytes" EOL, ( int )b->fillLevel );
 
         /* A zero length block marks the end of the data */
@@ -1747,8 +1799,25 @@ static void *_processBlocks( void *params )
         }
 
         pthread_mutex_lock( &r->dataForClients_m );
+        r->rawBlock[r->rp] = NULL;
         r->rp = ( r->rp + 1 ) % r->numBlocks;
+
+        if ( b == &_lastResort )
+        {
+            b = NULL;
+        }
+        else if ( r->numSpare < SPARE_BLOCKS )
+        {
+            r->spareBlock[r->numSpare++] = b;
+            b = NULL;
+        }
+
         pthread_mutex_unlock( &r->dataForClients_m );
+
+        if ( b )
+        {
+            _freeBlock( b );
+        }
 
         /* Live mode: results so far. Done here because this thread owns the instruction table. */
         if ( ( r->options->liveInterval ) && ( r->sampling ) &&
@@ -1819,14 +1888,18 @@ int main( int argc, char *argv[] )
         _r.numBlocks = MIN_RAW_BLOCKS;
     }
 
-    _r.rawBlock = ( struct dataBlock * )malloc( ( size_t )_r.numBlocks * sizeof( struct dataBlock ) );
-
-    if ( !_r.rawBlock )
+    _r.rawBlock = ( struct dataBlock ** )calloc( ( size_t )_r.numBlocks, sizeof( struct dataBlock * ) );
+    if ( _r.rawBlock )
     {
-        genericsExit( -1, "Can't allocate a %d MiB capture buffer, use a smaller -b" EOL, _r.options->bufferMB );
+        _r.rawBlock[0] = _allocBlock();
     }
 
-    _r.rawBlock[0].fillLevel = 0;
+    if ( ( !_r.rawBlock ) || ( !_r.rawBlock[0] ) )
+    {
+        genericsExit( -1, "Out of memory for the capture buffer" EOL );
+    }
+
+    _r.rawBlock[0]->fillLevel = 0;
 
     if ( _r.options->timelineFile )
     {
@@ -1918,7 +1991,7 @@ int main( int argc, char *argv[] )
             /* Data are gathered into large blocks: the decoder is usually slower than the trace */
             /* (every instruction is decoded), so the buffer (-b, numBlocks x TRANSFER_SIZE)      */
             /* holds the capture while decoding catches up.                                     */
-            struct dataBlock *rxBlock = &_r.rawBlock[_r.wp];
+            struct dataBlock *rxBlock = _r.rawBlock[_r.wp];
             size_t got = 0;
 
             enum ReceiveResult result = stream->receive( stream, rxBlock->buffer + rxBlock->fillLevel,
@@ -1989,13 +2062,13 @@ int main( int argc, char *argv[] )
     if ( processThreadStarted )
     {
         /* Pass on any partly filled block (there's always room for this one plus the end block) */
-        if ( _r.rawBlock[_r.wp].fillLevel > 0 )
+        if ( _r.rawBlock[_r.wp]->fillLevel > 0 )
         {
             _queueBlock( &_r, true );
         }
 
         genericsReport( V_INFO, "Capture done (%" PRIu64 " bytes), finishing decoding..." EOL, _r.intervalBytes );
-        _r.rawBlock[_r.wp].fillLevel = 0;
+        _r.rawBlock[_r.wp]->fillLevel = 0;
         _queueBlock( &_r, true );
         pthread_join( _r.processThread, NULL );
     }

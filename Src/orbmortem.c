@@ -52,6 +52,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
                                         /* (one ETM atom byte covers up to ~16 instructions)         */
 
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
+#define RESUME_BYTES        (16384)     /* Data after an automatic stop that counts as the trace having restarted (-r) */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
 #define TICK_TIME_MS        (100)       /* Time intervals for screen updates and keypress check */
 
@@ -62,6 +63,8 @@ struct Options
     char *file;                         /* File host connection */
     bool fileTerminate;                 /* Terminate when file read isn't successful */
     char *deleteMaterial;               /* Material to delete off front end of filenames */
+    int hangTime;                       /* ms without trace after which it is taken to have stopped */
+    bool autoResume;                    /* After an automatic stop, capture again when trace returns */
     char *journal;                      /* File that gets the source lines of each capture, for other tools */
     bool demangle;                      /* Indicator that C++ should be demangled */
 
@@ -87,6 +90,7 @@ struct Options
     .server    = REMOTE_SERVER,
     .demangle  = true,
     .traceProt = TRACE_PROT_ETM35,
+    .hangTime = HANG_TIME_MS,
     .tag       = 2,
     .buflen    = DEFAULT_PM_BUFLEN_K * 1024,
     .window    = DEFAULT_WINDOW_K * 1024
@@ -158,6 +162,8 @@ struct RunTime
     int32_t filenumLines;               /* ...and how many lines of it there are */
 
     bool held;                          /* If we are actively collecting data */
+    bool autoHeld;                      /* ...and it was the trace stopping that held us, not the user */
+    uint64_t heldBytes;                 /* Data that has arrived since then */
 
     struct SIOInstance *sio;            /* Our screen IO instance for managed I/O */
 
@@ -232,6 +238,8 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -E, --eof:          When reading from file, terminate at end of file" EOL );
     genericsFPrintf( stderr, "    -f, --input-file:   <filename>: Take input from specified file" EOL );
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
+    genericsFPrintf( stderr, "    -H, --hold-time:    <ms> Trace missing for this long means the program has stopped: show it (default %d)." EOL, HANG_TIME_MS );
+    genericsFPrintf( stderr, "                        Raise it if short gaps in the trace stop the capture" EOL );
     genericsFPrintf( stderr, "    -j, --journal:      <filename> Write the source lines of each capture, oldest first, as" EOL );
     genericsFPrintf( stderr, "                        file<TAB>line<TAB>function<TAB>text, for a debugger or editor to read" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
@@ -245,6 +253,8 @@ static void _printHelp( const char *const progName )
     }
 
     genericsFPrintf( stderr, "} trace protocol to use, default is %s" EOL, TRACEDecodeGetProtocolName( TRACE_PROT_LIST_START ) );
+    genericsFPrintf( stderr, "    -r, --resume:       After the trace stopped and was shown, start capturing again by itself when" EOL );
+    genericsFPrintf( stderr, "                        trace returns (beside a debugger: every halt shows a fresh history)" EOL );
     genericsFPrintf( stderr, "    -s, --server:       <Server>:<Port> to use" EOL );
     genericsFPrintf( stderr, "    -t, --tag:          <stream>: Which OFLOW tag to use (normally 2)" EOL );
     genericsFPrintf( stderr, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
@@ -270,7 +280,9 @@ static struct option _longOptions[] =
     {"alt-addr-enc", no_argument, NULL, 'A'},
     {"buffer-len", required_argument, NULL, 'b'},
     {"editor-cmd", required_argument, NULL, 'C'},
+    {"hold-time", required_argument, NULL, 'H'},
     {"journal", required_argument, NULL, 'j'},
+    {"resume", no_argument, NULL, 'r'},
     {"no-demangle", required_argument, NULL, 'D'},
     {"del-prefix", required_argument, NULL, 'd'},
     {"elf-file", required_argument, NULL, 'e'},
@@ -298,7 +310,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hj:VMO:p:P:s:t:v:wW:x:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hH:j:VMO:p:P:rs:t:v:wW:x:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -335,6 +347,23 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 r->options->window = ( int )k * 1024;
             }
             break;
+
+            // ------------------------------------
+            case 'H':
+                r->options->hangTime = atoi( optarg );
+
+                if ( r->options->hangTime < 50 )
+                {
+                    genericsReport( V_ERROR, "Hold time must be at least 50 ms" EOL );
+                    return false;
+                }
+
+                break;
+
+            // ------------------------------------
+            case 'r':
+                r->options->autoResume = true;
+                break;
 
             // ------------------------------------
             case 'j':
@@ -2445,6 +2474,30 @@ int main( int argc, char *argv[] )
                 usleep( TICK_TIME_MS * 100 );
             }
 
+            if ( ( _r.held ) && ( _r.autoHeld ) && ( _r.options->autoResume ) && ( stream ) && ( _r.rawBlock.fillLevel > 0 ) )
+            {
+                /* The trace stopped by itself and has now come back (the debugger let the program */
+                /* run again): capture afresh, so that the next stop shows what led up to it.      */
+                /* A few stray bytes are not a restart.                                            */
+                _r.heldBytes += _r.rawBlock.fillLevel;
+
+                if ( _r.heldBytes > RESUME_BYTES )
+                {
+                    _r.held = _r.autoHeld = false;
+                    _r.wp = _r.rp = 0;
+
+                    if ( _r.diving )
+                    {
+                        _doFilesurface( &_r );
+                    }
+
+                    _flushBuffer( &_r );
+                    SIOheld( _r.sio, _r.held );
+                    lastHTime = genericsTimestampmS();
+                    _r.oldTotalHangBytes = _r.newTotalBytes;
+                }
+            }
+
             if ( !_r.held )
             {
                 /* Pump all of the data through the protocol handler */
@@ -2489,6 +2542,7 @@ int main( int argc, char *argv[] )
                     if ( !_r.options->file )
                     {
                         _r.held = !_r.held;
+                        _r.autoHeld = false;
 
                         if ( !_r.held )
                         {
@@ -2638,7 +2692,7 @@ int main( int argc, char *argv[] )
             if ( ( !_r.numLines )  &&
                     (
                                 ( _r.options->file && !stream ) ||
-                                ( ( ( genericsTimestampmS() - lastHTime ) > HANG_TIME_MS ) &&
+                                ( ( ( genericsTimestampmS() - lastHTime ) > _r.options->hangTime ) &&
                                   ( _r.newTotalBytes - _r.oldTotalHangBytes == 0 ) &&
                                   ( _r.wp != _r.rp ) )
                     )
@@ -2652,12 +2706,14 @@ int main( int argc, char *argv[] )
                 else
                 {
                     _r.held = true;
+                    _r.autoHeld = true;
+                    _r.heldBytes = 0;
                     SIOheld( _r.sio, _r.held );
                 }
             }
 
             /* Update the intervals */
-            if ( ( genericsTimestampmS() - lastHTime ) > HANG_TIME_MS )
+            if ( ( genericsTimestampmS() - lastHTime ) > _r.options->hangTime )
             {
                 _r.oldTotalHangBytes = _r.newTotalBytes;
                 lastHTime = genericsTimestampmS();
