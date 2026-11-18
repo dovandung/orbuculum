@@ -52,7 +52,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
                                         /* (one ETM atom byte covers up to ~16 instructions)         */
 
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
-#define RESUME_BYTES        (16384)     /* Data after an automatic stop that counts as the trace having restarted (-r) */
+#define RESUME_BYTES        (0)         /* Data after an automatic stop above which the trace counts as restarted (-r) */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
 #define TICK_TIME_MS        (100)       /* Time intervals for screen updates and keypress check */
 
@@ -2478,7 +2478,8 @@ int main( int argc, char *argv[] )
             {
                 /* The trace stopped by itself and has now come back (the debugger let the program */
                 /* run again): capture afresh, so that the next stop shows what led up to it.      */
-                /* A few stray bytes are not a restart.                                            */
+                /* Any data counts, and the block that brought it is decoded too: a run between    */
+                /* two breakpoints can be only a few hundred bytes of trace.                       */
                 _r.heldBytes += _r.rawBlock.fillLevel;
 
                 if ( _r.heldBytes > RESUME_BYTES )
