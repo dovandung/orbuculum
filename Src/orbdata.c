@@ -69,6 +69,8 @@ struct watch
     uint64_t count;
     double min, max, last;
     uint32_t lastPC;                        /* PC of the access, when the comparator sends it */
+    uint64_t rateCount;                     /* Live view: count when the rate was last worked out */
+    double rate;                            /* ...and the accesses per second since then */
     bool havePC;
 };
 
@@ -96,6 +98,7 @@ struct
     bool withPC;
     char access;                            /* w, r or b(oth) */
     bool quiet;
+    bool live;                              /* Table of the latest values, updated in place */
     bool mono;
 
     struct watch w[MAX_WATCH];
@@ -130,6 +133,8 @@ struct
     uint64_t samples;
     uint64_t unknownComp;
     double startTime;
+    double liveDrawn;                       /* When the live table was last drawn */
+    double rateTime;                        /* When the rates were last worked out */
 } _r;
 
 // ====================================================================================================
@@ -542,6 +547,8 @@ void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -f, --input-file:   <filename> Take input from specified file" EOL );
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
     genericsFPrintf( stderr, "    -l, --length:       <ms> Stop after this time (default: until CTRL-C)" EOL );
+    genericsFPrintf( stderr, "    -L, --live:         Show a table of the latest value of each variable, updated in place," EOL );
+    genericsFPrintf( stderr, "                        instead of a line per sample (samples still go to the -o file)" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
     genericsFPrintf( stderr, "    -o, --output-file:  <filename> CSV file for the samples (default: the screen)" EOL );
@@ -575,6 +582,7 @@ static struct option _longOptions[] =
     {"input-file", required_argument, NULL, 'f'},
     {"help", no_argument, NULL, 'h'},
     {"length", required_argument, NULL, 'l'},
+    {"live", no_argument, NULL, 'L'},
     {"no-colour", no_argument, NULL, 'M'},
     {"no-color", no_argument, NULL, 'M'},
     {"itm-sync", no_argument, NULL, 'n'},
@@ -640,7 +648,7 @@ bool _processOptions( int argc, char *argv[] )
     bool serverExplicit = false;
     bool portExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "a:e:Ef:hl:Mno:p:Pqs:S:t:v:Vw:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "a:e:Ef:hl:LMno:p:Pqs:S:t:v:Vw:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             case 'a':
@@ -779,6 +787,10 @@ bool _processOptions( int argc, char *argv[] )
 
                 break;
 
+            case 'L':
+                options.live = true;
+                break;
+
             case 'h':
                 _printHelp( argv[0] );
                 return false;
@@ -808,6 +820,82 @@ bool _processOptions( int argc, char *argv[] )
     }
 
     return true;
+}
+// ====================================================================================================
+static void _fmtValue( const struct watch *w, double v, char *out, size_t len )
+
+{
+    if ( w->format == 'x' )
+    {
+        snprintf( out, len, "0x%0*" PRIX32, ( int )w->size * 2, ( uint32_t )v );
+    }
+    else if ( w->format == 'f' )
+    {
+        snprintf( out, len, "%.9g", v );
+    }
+    else
+    {
+        snprintf( out, len, "%.0f", v );
+    }
+}
+// ====================================================================================================
+static void _liveDraw( bool final )
+
+/* The latest value of every watched variable, redrawn in place a few times a second */
+
+{
+    double now = _now();
+    char val[40], mn[40], mx[40];
+
+    if ( ( !final ) && ( now - _r.liveDrawn < 0.25 ) )
+    {
+        return;
+    }
+
+    _r.liveDrawn = now;
+
+    if ( now - _r.rateTime >= 1.0 )
+    {
+        for ( int i = 0; i < options.nwatch; i++ )
+        {
+            struct watch *w = &options.w[i];
+            w->rate = ( w->count - w->rateCount ) / ( now - _r.rateTime );
+            w->rateCount = w->count;
+        }
+
+        _r.rateTime = now;
+    }
+
+    genericsFPrintf( stdout, CLEAR_SCREEN );
+    genericsFPrintf( stdout, C_YELLOW "%-28s %14s %12s %10s %14s %14s  %s" C_RESET EOL, "Variable", "Value", "Accesses", "Per second", "Min", "Max", "Last from" );
+
+    for ( int i = 0; i < options.nwatch; i++ )
+    {
+        struct watch *w = &options.w[i];
+
+        if ( !w->count )
+        {
+            genericsFPrintf( stdout, "%-28.28s %14s %12s" EOL, w->name, "-", "0" );
+            continue;
+        }
+
+        _fmtValue( w, w->last, val, sizeof( val ) );
+        _fmtValue( w, w->min, mn, sizeof( mn ) );
+        _fmtValue( w, w->max, mx, sizeof( mx ) );
+        genericsFPrintf( stdout, "%-28.28s " C_LCYAN "%14s" C_RESET " %12" PRIu64 " %10.0f %14s %14s", w->name, val, w->count, w->rate, mn, mx );
+
+        if ( w->havePC )
+        {
+            genericsFPrintf( stdout, "  0x%08" PRIx32, w->lastPC );
+        }
+
+        genericsFPrintf( stdout, EOL );
+    }
+
+    genericsFPrintf( stdout, EOL "%.1f s, %" PRIu64 " samples%s%s%s" EOL, now - _r.startTime, _r.samples,
+                    options.outfile ? ", saving to " : "", options.outfile ? options.outfile : "",
+                    final ? "" : "   (CTRL-C to stop)" );
+    fflush( stdout );
 }
 // ====================================================================================================
 static void _intHandler( int sig )
@@ -858,7 +946,7 @@ int main( int argc, char *argv[] )
             genericsExit( -2, "Could not open %s for writing" EOL, options.outfile );
         }
     }
-    else if ( !options.quiet )
+    else if ( ( !options.quiet ) && ( !options.live ) )
     {
         _r.out = stdout;
     }
@@ -876,6 +964,7 @@ int main( int argc, char *argv[] )
     ITMDecoderInit( &_r.i, options.forceITMSync );
     OFLOWInit( &_r.c );
     _r.startTime = _now();
+    _r.rateTime = _r.startTime;
 
     while ( !_r.ending )
     {
@@ -929,6 +1018,11 @@ int main( int argc, char *argv[] )
                 fflush( _r.out );
             }
 
+            if ( options.live )
+            {
+                _liveDraw( false );
+            }
+
             if ( ( options.timelen ) && ( ( _now() - _r.startTime ) * 1000.0 > options.timelen ) )
             {
                 _r.ending = true;
@@ -945,6 +1039,11 @@ int main( int argc, char *argv[] )
     }
 
     _flushPending();
+
+    if ( options.live )
+    {
+        _liveDraw( true );
+    }
 
     if ( ( _r.out ) && ( _r.out != stdout ) )
     {
