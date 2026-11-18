@@ -40,6 +40,7 @@
 #define DWT_FUNCTION(n) (0xE0001028u + 16u * (n))
 #define DEMCR           (0xE000EDFCu)
 #define ITM_LAR         (0xE0000FB0u)
+#define DWT_LAR         (0xE0001FB0u)
 #define ITM_TCR         (0xE0000E80u)
 
 #define FN_DATA_WRITE   (0xDu)              /* Sample data value on write */
@@ -498,6 +499,7 @@ static void _printSetup( void )
 
     OR( DEMCR, 0x01000000u, "DEMCR.TRCENA: DWT and ITM on" );
     WR( ITM_LAR, 0xC5ACCE55u, "unlock the ITM" );
+    WR( DWT_LAR, 0xC5ACCE55u, "unlock the DWT (needed from firmware on a Cortex-M7, ignored on M3/M4)" );
     OR( ITM_TCR, 0x00000009u, "ITM enable, and pass DWT packets on (TXENA)" );
 
     for ( int i = 0; i < options.nwatch; i++ )
