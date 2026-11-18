@@ -1,4 +1,10 @@
 {
+    // Cortex-Debug: where the debugger programs are (edit for your PC, forward slashes).
+    // The -py gdb is the one with Python, needed for the trace-back commands.
+    "cortex-debug.armToolchainPath": "C:/arm_none_eabi/bin",
+    "cortex-debug.gdbPath": "C:/arm_none_eabi/bin/arm-none-eabi-gdb-py.exe",
+    "cortex-debug.openocdPath": "D:/openocd/bin/openocd.exe",
+
     // Coverage Gutters (extension ryanluker.vscode-coverage-gutters): colour the source lines from
     // the lcov file that "Trace: live coverage" keeps rewriting. Click "Watch" in the status bar.
     "coverage-gutters.coverageFileNames": [ "coverage.info" ],

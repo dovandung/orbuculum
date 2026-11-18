@@ -20,9 +20,10 @@ pins, and connect the two:
 3. In `tasks.json` set the three paths under `options.env` and the default ELF/AXF under `inputs`.
 4. In `launch.json` keep the configuration for your debug probe, and set `executable`, `device`
    and the path of `orbtrace_gdb.py`.
-5. The gdb commands need an `arm-none-eabi-gdb` built with Python. If `source ...orbtrace_gdb.py`
-   fails with "Python scripting is not supported", remove the three `postAttachCommands` lines;
-   everything else still works.
+5. The gdb commands need a gdb built with Python: `arm-none-eabi-gdb-py.exe` in the Arm GNU
+   Toolchain. Set `cortex-debug.gdbPath` to it. It loads `python38.dll`: unzip the "Windows
+   embeddable package (64-bit)" of Python 3.8.10 from python.org next to it. Without a Python
+   gdb, remove the `postAttachCommands` lines; everything else still works.
 
 ## Using it
 
@@ -46,9 +47,10 @@ short of CPU.
 Coverage Gutters only colours lines. The small extension in `orb-line-counts` adds the count in
 front of every line, from the same `coverage.info`, updated while `orbprofile -l` runs.
 
-1. Copy the folder `orb-line-counts` to `%USERPROFILE%\.vscode\extensions\` (Linux/macOS:
-   `~/.vscode/extensions/`).
-2. Restart VS Code.
+1. In VS Code open the Extensions panel, click `...` at its top right, choose
+   **Install from VSIX...** and select `orb-line-counts/orb-line-counts-0.1.0.vsix`.
+   (A folder copied into the extensions directory by hand is ignored by VS Code.)
+2. Reload the window if asked.
 3. Run **Trace: live coverage**. Each line of a traced source file shows its count: `15030`,
    `123k`, `4.56M`. `0` (in red) is a line that has code but did not run; lines without code
    show nothing. Hover over a count for the exact number.
