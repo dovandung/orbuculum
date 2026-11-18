@@ -783,11 +783,12 @@ The command line options of note are;
 
  `-b, --buffer-len [Length]`: Set length of post-mortem buffer, in KBytes (Default 32 KBytes)
 
- `-C, --editor-cmd [command]`: Set command line for external editor ( %f = filename, %l = line). A few examples are;
+ `-C, --editor-cmd [command]`: Set command line for external editor ( %f = filename, %l = line), run for the line under the cursor with `O` (or Shift-Right). A few examples are;
 
      * emacs; `-C emacs "+%l %f"`
      * codium/VSCode; `-C codium  -g "%f:%l"`
      * eclipse; `-C eclipse "%f:%l"`
+     * Notepad++ (Windows); `-C "start notepad++ %f -n%l"`
 
  `-D, --no-demangle`: Switch off C++ symbol demangling
 
@@ -801,11 +802,17 @@ The command line options of note are;
 
  `-h, --help`: Provide brief help
 
+ `-H, --hold-time [ms]`: Trace missing for this long means the program has stopped, and the buffer is shown (default 200). Raise it if short gaps in the trace stop the capture.
+
+ `-j, --journal [filename]`: Write the source lines of each capture, oldest first, as file, line, function and text (tab separated), for a debugger or editor to read. `Support/orbtrace_gdb.py` uses it.
+
  `-O, --objdump-opts [options]`: Options to pass directly to objdump
 
  `-p, --protocol [OFLOW|ETM]`: Protocol to communicate with the source. Defaults to OFLOW if `-s` is not set, otherwise ETM.
 
  `-P, --trace-proto [ETM3.5|MTB|ETM4]`: Trace protocol of the CPU. ETM3.5 (default) for Cortex-M3/M4, ETM4 for Cortex-M7. Note that MTB only makes sense from a file.
+
+ `-r, --resume`: After the trace stopped and was shown, start capturing again by itself when trace returns. Beside a debugger every halt then shows a fresh history without pressing `H`.
 
  `-s, --server [Server:Port]`: to use
 
@@ -818,6 +825,14 @@ The command line options of note are;
 
 Once it's running you will receive an indication at the lower right of the screen that it's capturing data. Hitting `H` will hold the capture and it will decode whatever is currently in the buffer. More usefully, if the capture stream is lost (e.g. because of debugger entry) then it will auto-hold and decode the buffer, showing you the last instructions executed. You can use the arrow keys to move around this buffer and dive into individual source files. Hit the `?` key for a quick overview of available commands.
 
+
+**Beside a debugger.** A debug probe uses the SWD pins and the trace probe the trace pins, so both work at once:
+run `orbmortem -e firmware.elf -r` next to Keil, IAR or gdb and every breakpoint (after the point where trace is
+switched on) shows the code that led to it. With `-j trace.journal` the gdb commands in `Support/orbtrace_gdb.py`
+(`trace-back`, `trace-calls`, `trace-auto`) list that history in the debug console; they need a gdb built with
+Python. `Support/vscode` has ready-made VS Code tasks, launch and settings files for a Cortex-Debug session with
+trace, live coverage shown in the editor (Coverage Gutters), and a small extension, `orb-line-counts`, that shows
+how many times each line ran. See `Support/vscode/README.md`.
 
 Orbprofile
 ----------
@@ -907,7 +922,14 @@ Open the file at https://ui.perfetto.dev (Open trace file) or in `chrome://traci
 what ran when, with calls nested under their callers and interrupt handlers nested where they interrupted. Time is
 counted in instructions executed, or in CPU cycles when the ETM is cycle accurate (the viewer labels it as
 microseconds). A busy target makes millions of calls per second: use `-G` to leave out short calls (e.g. `-G 50`),
-and a short `-I`. At most 5 million calls are written.
+and a short `-I`. At most 5 million calls are written. The function the trace started in (normally `main`) is
+drawn as the bottom bar.
+
+`Support/timeline_calib.py` turns those counts into real time, using a function that runs at a known rate as the
+ruler: `python3 Support/timeline_calib.py timeline.json -r SysTick_Handler -p 1ms` (several rates: `-p 1ms,10us`).
+
+**Memory.** Trace that arrives faster than it can be decoded waits in a buffer of at most `-b` MiB (default 1024).
+Memory is only used for what is waiting, so a capture the decoder keeps up with stays at a few MB.
 
 Things to know;
 
@@ -957,6 +979,10 @@ tools call data trace or a logic analyzer view.
    python3 Support/orbdata_plot.py data.csv
    ```
 
+   For a live view, `-L` shows a table of the latest value of every variable (with count, rate, minimum and
+   maximum) updated in place, and `python3 Support/orbdata_plot.py data.csv --live` scrolls a graph while
+   `orbdata -o data.csv` writes the file (or pipe: `orbdata ... | python3 Support/orbdata_plot.py - --live`).
+
 The CSV columns are `time_s,ticks,variable,value,access,pc`: host time, target timestamp ticks (if on), and the
 address of the code that made the access when the setup was made with `-P`. A summary (count, min, max, last per
 variable) is printed at the end. Options;
@@ -970,6 +996,8 @@ variable) is printed at the end. Options;
  `-f, --input-file [filename]`: Take input from specified file
 
  `-l, --length [ms]`: Stop after this time (default: until CTRL-C)
+
+ `-L, --live`: Show a table of the latest value of each variable, updated in place, instead of a line per sample
 
  `-o, --output-file [filename]`: CSV file for the samples (default: the screen)
 

@@ -1,4 +1,11 @@
 Version 2.3.0 In progress
+* Support/vscode: tasks, launch and settings files to run the trace tools beside a Cortex-Debug session, and the orb-line-counts extension that shows in the editor how many times each line ran
+* Support/orbtrace_gdb.py: gdb commands trace-back, trace-calls and trace-auto, showing what ran before the program stopped
+* orbmortem: -r resumes capturing by itself when trace returns after a stop, -H sets the hold time, -j writes the source lines of each capture to a file, O (or Shift-Right) opens the line under the cursor with the -C editor command (the key was never wired up)
+* orbdata: -L live table of the latest values; orbdata_plot.py --live scrolling graph; --setup unlocks the DWT (Cortex-M7); --setup c takes variable addresses from the linker
+* orbprofile: capture buffer memory is only used for trace waiting to be decoded; default limit raised to 1024 MiB
+* orbprofile timeline: the function the trace started in (main) gets a bar; program name escaped (a Windows path made the file invalid JSON); the clock (instructions or cycles) is chosen once
+* Support/timeline_calib.py: real time for an orbprofile timeline, from a function that runs at a known rate
 * orbprofile: decoding about twice as fast (ETM3.5 decoder fast paths for P-headers and branch addresses, no debug text built unless asked for, instruction records linked to their successors, tight loop for plain instructions). Output unchanged.
 * New tool orbdata: logs the values written to (or read from) up to four variables from DWT data trace, to CSV; --setup prints the comparator setup for gdb, Keil, IAR or C. gdb command dwtWatch, Support/orbdata_plot.py
 * orbprofile: function timeline (-g <file>, -G <min length>): every call and exception as Chrome trace JSON, for ui.perfetto.dev or chrome://tracing
