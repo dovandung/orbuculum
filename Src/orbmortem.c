@@ -62,6 +62,7 @@ struct Options
     char *file;                         /* File host connection */
     bool fileTerminate;                 /* Terminate when file read isn't successful */
     char *deleteMaterial;               /* Material to delete off front end of filenames */
+    char *journal;                      /* File that gets the source lines of each capture, for other tools */
     bool demangle;                      /* Indicator that C++ should be demangled */
 
     char *elffile;                      /* File to use for symbols etc. */
@@ -223,13 +224,16 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "Usage: %s [options]" EOL, progName );
     genericsFPrintf( stderr, "    -A, --alt-addr-enc: Do not use alternate address encoding" EOL );
     genericsFPrintf( stderr, "    -b, --buffer-len:   <Length> Length of post-mortem buffer, in KBytes (Default %d KBytes)" EOL, DEFAULT_PM_BUFLEN_K );
-    genericsFPrintf( stderr, "    -C, --editor-cmd:   <command> Command line for external editor (%%f = filename, %%l = line)" EOL );
+    genericsFPrintf( stderr, "    -C, --editor-cmd:   <command> Command line for external editor (%%f = filename, %%l = line)," EOL );
+    genericsFPrintf( stderr, "                        run for the line under the cursor with O. For VS Code: \"code -g %%f:%%l\"" EOL );
     genericsFPrintf( stderr, "    -D, --no-demangle:  Switch off C++ symbol demangling" EOL );
     genericsFPrintf( stderr, "    -d, --del-prefix:   <String> Material to delete off the front of filenames" EOL );
     genericsFPrintf( stderr, "    -e, --elf-file:     <ElfFile> to use for symbols and source" EOL );
     genericsFPrintf( stderr, "    -E, --eof:          When reading from file, terminate at end of file" EOL );
     genericsFPrintf( stderr, "    -f, --input-file:   <filename>: Take input from specified file" EOL );
     genericsFPrintf( stderr, "    -h, --help:         This help" EOL );
+    genericsFPrintf( stderr, "    -j, --journal:      <filename> Write the source lines of each capture, oldest first, as" EOL );
+    genericsFPrintf( stderr, "                        file<TAB>line<TAB>function<TAB>text, for a debugger or editor to read" EOL );
     genericsFPrintf( stderr, "    -M, --no-colour:    Supress colour in output" EOL );
     genericsFPrintf( stderr, "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
     genericsFPrintf( stderr, "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise ETM" EOL );
@@ -266,6 +270,7 @@ static struct option _longOptions[] =
     {"alt-addr-enc", no_argument, NULL, 'A'},
     {"buffer-len", required_argument, NULL, 'b'},
     {"editor-cmd", required_argument, NULL, 'C'},
+    {"journal", required_argument, NULL, 'j'},
     {"no-demangle", required_argument, NULL, 'D'},
     {"del-prefix", required_argument, NULL, 'd'},
     {"elf-file", required_argument, NULL, 'e'},
@@ -293,7 +298,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool protExplicit = false;
     bool serverExplicit = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hVMO:p:P:s:t:v:wW:x:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:C:Dd:Ee:f:hj:VMO:p:P:s:t:v:wW:x:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -330,6 +335,11 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 r->options->window = ( int )k * 1024;
             }
             break;
+
+            // ------------------------------------
+            case 'j':
+                r->options->journal = optarg;
+                break;
 
             // ------------------------------------
             case 'C':
@@ -1745,6 +1755,81 @@ static void _showDecoded( struct RunTime *r )
     SIOinfoText( r->sio, t );
 }
 // ====================================================================================================
+static void _writeJournal( struct RunTime *r )
+
+/* The source lines of the capture just decoded, oldest first, for a debugger or an editor: */
+/* file, line, function and text, tab separated. Written whole and then renamed, so a      */
+/* reader never sees half of it.                                                             */
+
+{
+    char tmp[SCRATCH_STRING_LEN];
+    char file[SCRATCH_STRING_LEN] = "";
+    const char *func = "";
+    FILE *f;
+
+    snprintf( tmp, SCRATCH_STRING_LEN, "%s.tmp", r->options->journal );
+    f = fopen( tmp, "wb" );
+
+    if ( !f )
+    {
+        return;
+    }
+
+    for ( int32_t w = 0; w < r->numLines; w++ )
+    {
+        const char *p = r->opText[w].buffer;
+
+        if ( !p )
+        {
+            /* A source line whose text could not be read is still a place that was reached */
+            if ( r->opText[w].lt != LT_SOURCE )
+            {
+                continue;
+            }
+
+            p = "";
+        }
+
+        if ( r->opText[w].lt == LT_FILE )
+        {
+            /* "filename::function" */
+            const char *sep = strstr( p, "::" );
+            size_t n = sep ? ( size_t )( sep - p ) : 0;
+
+            if ( n >= sizeof( file ) )
+            {
+                n = sizeof( file ) - 1;
+            }
+
+            memcpy( file, p, n );
+            file[n] = 0;
+            func = sep ? sep + 2 : "";
+        }
+        else if ( ( r->opText[w].lt == LT_SOURCE ) && ( file[0] ) )
+        {
+            const char *e = func;
+
+            while ( ( *e ) && ( *e != '\n' ) && ( *e != '\r' ) )
+            {
+                e++;
+            }
+
+            fprintf( f, "%s\t%d\t%.*s\t", file, r->opText[w].line, ( int )( e - func ), func );
+
+            for ( ; ( *p ) && ( *p != '\n' ) && ( *p != '\r' ); p++ )
+            {
+                fputc( ( *p == '\t' ) ? ' ' : *p, f );
+            }
+
+            fputc( '\n', f );
+        }
+    }
+
+    fclose( f );
+    remove( r->options->journal );
+    rename( tmp, r->options->journal );
+}
+// ====================================================================================================
 static bool _dumpBuffer( struct RunTime *r )
 
 /* Dump the received data buffer into the text buffer: only the last window of it (-W), so */
@@ -1786,6 +1871,11 @@ static bool _dumpBuffer( struct RunTime *r )
     /* Submit this constructed buffer for display */
     SIOsetOutputBuffer( r->sio, r->numLines, r->numLines - 1, &r->opText, false );
     _showDecoded( r );
+
+    if ( r->options->journal )
+    {
+        _writeJournal( r );
+    }
 
     return true;
 }
@@ -2026,6 +2116,56 @@ static void _doFilesurface( struct RunTime *r )
 
     SIOsetOutputBuffer( r->sio, r->numLines, r->numLines - 1, &r->opText, false );
     SIOsetCurrentLineno( r->sio, r->lineNum );
+}
+// ====================================================================================================
+static void _doFileOpen( struct RunTime *r )
+
+/* Open the source line of the code under the cursor in the external editor: the -C command, */
+/* with %f replaced by the file name and %l by the line number.                              */
+
+{
+    char cmd[2 * SCRATCH_STRING_LEN];
+    struct symbolLineStore *l = _fileAndLine( r, SIOgetCurrentLineno( r->sio ) );
+    const char *fn = l ? symbolGetFilename( r->s, l->filename ) : NULL;
+    size_t o = 0;
+
+    if ( !fn )
+    {
+        SIOalert( r->sio, "No source line here" );
+        return;
+    }
+
+    for ( const char *c = r->options->openFileCL; ( *c ) && ( o < sizeof( cmd ) - SCRATCH_STRING_LEN ); c++ )
+    {
+        if ( ( c[0] == '%' ) && ( c[1] == 'f' ) )
+        {
+            /* Forward slashes: every editor takes them, and no shell eats them */
+            for ( const char *q = fn; ( *q ) && ( o < sizeof( cmd ) - 64 ); q++ )
+            {
+                cmd[o++] = ( *q == '\\' ) ? '/' : *q;
+            }
+
+            c++;
+        }
+        else if ( ( c[0] == '%' ) && ( c[1] == 'l' ) )
+        {
+            o += snprintf( &cmd[o], 16, "%u", ( unsigned )l->startline );
+            c++;
+        }
+        else
+        {
+            cmd[o++] = *c;
+        }
+    }
+
+    /* Nothing the editor prints may land on this screen */
+#ifdef WIN32
+    snprintf( &cmd[o], 32, " >NUL 2>&1" );
+#else
+    snprintf( &cmd[o], 32, " >/dev/null 2>&1 &" );
+#endif
+
+    SIOalert( r->sio, ( system( cmd ) == 0 ) ? "Opened in editor" : "Editor command failed" );
 }
 // ====================================================================================================
 static void _doSave( struct RunTime *r, bool includeDebug )
@@ -2473,7 +2613,11 @@ int main( int argc, char *argv[] )
                 case SIO_EV_FOPEN: // ------------------- Request for file open -----------------------------------------
                     if ( _r.options->openFileCL )
                     {
-                        //                        _doFileOpen( &_r, false );
+                        _doFileOpen( &_r );
+                    }
+                    else
+                    {
+                        SIOalert( _r.sio, "No editor set (-C)" );
                     }
 
                     break;

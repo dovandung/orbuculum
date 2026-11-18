@@ -1,0 +1,55 @@
+{
+    // Debug with the Cortex-Debug extension (marus25.cortex-debug) while the trace probe listens.
+    // "attach" leaves the firmware that is on the board alone: build and flash it as you do now.
+    // Use the configuration that matches your debug probe and delete the others.
+    //
+    // The gdb commands trace-back, trace-calls and trace-auto come from orbtrace_gdb.py and need
+    // an arm-none-eabi-gdb that was built with Python.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach + trace (ST-LINK, OpenOCD)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/Objects/blink_etmstress.axf",
+            "configFiles": [ "interface/stlink.cfg", "target/stm32f4x.cfg" ],
+            "postAttachCommands": [
+                "source D:/myjob/orbtrace/bin/orbtrace_gdb.py",
+                "set orbtrace-journal ${workspaceFolder}/trace.journal",
+                "trace-auto 10"
+            ]
+        },
+        {
+            "name": "Attach + trace (ST-LINK GDB server)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "servertype": "stlink",
+            "device": "STM32F407VE",
+            "interface": "swd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/Objects/blink_etmstress.axf",
+            "postAttachCommands": [
+                "source D:/myjob/orbtrace/bin/orbtrace_gdb.py",
+                "set orbtrace-journal ${workspaceFolder}/trace.journal",
+                "trace-auto 10"
+            ]
+        },
+        {
+            "name": "Attach + trace (J-Link)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "servertype": "jlink",
+            "device": "STM32F407VE",
+            "interface": "swd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/Objects/blink_etmstress.axf",
+            "postAttachCommands": [
+                "source D:/myjob/orbtrace/bin/orbtrace_gdb.py",
+                "set orbtrace-journal ${workspaceFolder}/trace.journal",
+                "trace-auto 10"
+            ]
+        }
+    ]
+}

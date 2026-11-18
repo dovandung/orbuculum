@@ -203,7 +203,7 @@ static void _outputHelp( struct SIOInstance *sio )
     wprintw( sio->outputWindow, "    0..%d: Move to mark in sample buffer, if its defined" EOL EOL, MAX_TAGS - 1 );
     wprintw( sio->outputWindow, "      ->: Dive into source file that contains the referenced code" EOL );
     wprintw( sio->outputWindow, "      <-: Surface from source file that contains the referenced code" EOL );
-    wprintw( sio->outputWindow, " Shift->: Open source file that contains the referenced code in external editor (if defined)" EOL );
+    wprintw( sio->outputWindow, " O or Shift->: Open the source line of the referenced code in the external editor (-C)" EOL );
     wprintw( sio->outputWindow, "  CTRL-C: Quit the current task or the application" EOL );
     wprintw( sio->outputWindow, "  CTRL-L: Refresh the screen" EOL );
     wprintw( sio->outputWindow, "  CTRL-R: Search backwards, CTRL-R again for next match" EOL );
@@ -1294,6 +1294,8 @@ enum SIOEvent SIOHandler( struct SIOInstance *sio, bool isTick, uint64_t oldinte
                     op = SIO_EV_DIVE;
                     break;
 
+                case 'o':
+                case 'O':
                 case 402:
                     op = SIO_EV_FOPEN;
                     break;

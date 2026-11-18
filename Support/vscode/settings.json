@@ -1,0 +1,9 @@
+{
+    // Coverage Gutters (extension ryanluker.vscode-coverage-gutters): colour the source lines from
+    // the lcov file that "Trace: live coverage" keeps rewriting. Click "Watch" in the status bar.
+    "coverage-gutters.coverageFileNames": [ "coverage.info" ],
+    "coverage-gutters.showLineCoverage": true,
+    // The gutter is where breakpoints go, so keep coverage out of it
+    "coverage-gutters.showGutterCoverage": false,
+    "coverage-gutters.showRulerCoverage": true
+}

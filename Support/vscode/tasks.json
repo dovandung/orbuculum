@@ -1,0 +1,81 @@
+{
+    // Trace tasks for VS Code. Run them with Terminal > Run Task.
+    // Edit the three paths in "options.env" below, and the ELF/AXF name in "inputs", for your project.
+    "version": "2.0.0",
+    "options": {
+        "env": {
+            // Folder with the Orbuculum tools (orbuculum.exe, orbprofile.exe ...)
+            "ORB_BIN": "D:/myjob/orbtrace/bin",
+            // Program that serves the probe's raw trace on TCP 3450 (Tang Nano 20K + MS2130 probe)
+            "ORB_PROBE": "D:/myjob/ms2130_tangnano/etm_tracer_x/pc/x64/etm_tracer_x.exe",
+            // objdump for orbprofile and orbmortem
+            "OBJDUMP": "D:/myjob/orbtrace/bin/arm-none-eabi-objdump.exe"
+        }
+    },
+    "inputs": [
+        {
+            "id": "elf",
+            "type": "promptString",
+            "description": "ELF/AXF file of the firmware on the board",
+            "default": "${workspaceFolder}/Objects/blink_etmstress.axf"
+        }
+    ],
+    "tasks": [
+        {
+            "label": "Trace: probe",
+            "type": "shell",
+            "command": "& $env:ORB_PROBE",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "group": "trace", "reveal": "silent" }
+        },
+        {
+            "label": "Trace: hub",
+            "type": "shell",
+            "command": "& \"$env:ORB_BIN/orbuculum.exe\" -s localhost:3450 -T -t 1,2",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "group": "trace", "reveal": "silent" }
+        },
+        {
+            "label": "Trace: start (probe + hub)",
+            "dependsOn": [ "Trace: probe", "Trace: hub" ],
+            "problemMatcher": []
+        },
+        {
+            // Instruction history. When the debugger halts the CPU the last instructions are shown here,
+            // and written to trace.journal for the gdb commands trace-back and trace-calls.
+            // O on a line opens that source line in the editor.
+            "label": "Trace: history (orbmortem)",
+            "type": "shell",
+            "command": "& \"$env:ORB_BIN/orbmortem.exe\" -e '${input:elf}' -P ETM3.5 -j '${workspaceFolder}/trace.journal' -C 'code -g %f:%l'",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always", "focus": true }
+        },
+        {
+            // Coverage that keeps updating; Coverage Gutters shows it in the editor.
+            "label": "Trace: live coverage",
+            "type": "shell",
+            "command": "& \"$env:ORB_BIN/orbprofile.exe\" -e '${input:elf}' -c '${workspaceFolder}/coverage.info' -l 1000",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" }
+        },
+        {
+            "label": "Trace: timeline (10 s, for Perfetto)",
+            "type": "shell",
+            "command": "& \"$env:ORB_BIN/orbprofile.exe\" -e '${input:elf}' -I 10000 -g '${workspaceFolder}/timeline.json' -G 10 -b 1000",
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" }
+        },
+        {
+            "label": "Trace: ITM console (channel 0)",
+            "type": "shell",
+            "command": "& \"$env:ORB_BIN/orbcat.exe\" -c '0,%c'",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" }
+        }
+    ]
+}
