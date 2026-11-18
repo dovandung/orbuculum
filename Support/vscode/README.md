@@ -40,3 +40,20 @@ The debugger must leave the trace pins alone: the firmware (or a gdb script such
 
 orbmortem and orbprofile both decode the ETM stream; run one of them at a time if the PC is
 short of CPU.
+
+## How many times each line ran
+
+Coverage Gutters only colours lines. The small extension in `orb-line-counts` adds the count in
+front of every line, from the same `coverage.info`, updated while `orbprofile -l` runs.
+
+1. Copy the folder `orb-line-counts` to `%USERPROFILE%\.vscode\extensions\` (Linux/macOS:
+   `~/.vscode/extensions/`).
+2. Restart VS Code.
+3. Run **Trace: live coverage**. Each line of a traced source file shows its count: `15030`,
+   `123k`, `4.56M`. `0` (in red) is a line that has code but did not run; lines without code
+   show nothing. Hover over a count for the exact number.
+4. Click **Counts** in the status bar, or run **Orbuculum: Show/Hide Line Counts**, to switch
+   it off and on.
+
+The file name is the setting `orbLineCounts.coverageFile` (default `coverage.info` in the
+workspace folder).

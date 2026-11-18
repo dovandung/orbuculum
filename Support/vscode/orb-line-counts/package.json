@@ -1,0 +1,32 @@
+{
+  "name": "orb-line-counts",
+  "displayName": "Orbuculum line counts",
+  "description": "Shows how many times each source line ran, from the lcov file written by orbprofile -c / -l",
+  "version": "0.1.0",
+  "publisher": "orbuculum",
+  "license": "BSD-3-Clause",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": [ "Other" ],
+  "activationEvents": [ "onStartupFinished" ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "orbLineCounts.toggle", "title": "Orbuculum: Show/Hide Line Counts" }
+    ],
+    "configuration": {
+      "title": "Orbuculum line counts",
+      "properties": {
+        "orbLineCounts.coverageFile": {
+          "type": "string",
+          "default": "coverage.info",
+          "description": "lcov file written by orbprofile -c, relative to the workspace folder (or an absolute path)"
+        },
+        "orbLineCounts.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the counts when a coverage file is found"
+        }
+      }
+    }
+  }
+}
