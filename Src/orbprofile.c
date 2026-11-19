@@ -169,6 +169,7 @@ struct dropSample                               /* State once a second, for the 
     uint64_t liveMs;
     uint32_t waitingBlocks;
     uint32_t blockMs;                           /* How long the decoder has been on its current block */
+    int core;                                   /* Processor the decoding thread was last seen on */
 };
 
 struct RunTime
@@ -220,6 +221,9 @@ struct RunTime
     volatile uint64_t decodedBytes;             /* Trace handed to the decoder so far */
     volatile uint64_t decodeCpuMs;              /* Processor time the decoding thread has used */
     volatile uint64_t liveMs;                   /* ...and the time it spent writing live results */
+    volatile int decodeCore;                    /* Processor the decoding thread is on */
+    int fastCores;                              /* Windows: performance cores the process was put on (0 = not done) */
+    int slowCores;                              /* ...and efficiency cores it is kept off */
     volatile uint32_t blockStartMs;             /* When the decoder started on its current block */
     struct dropSample samp[DROP_SAMPLES];       /* One entry a second, most recent at sampHead-1 */
     int sampHead;
@@ -1712,6 +1716,117 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     }
 }
 // ====================================================================================================
+static int _currentCore( void )
+
+{
+#ifdef WIN32
+    return ( int )GetCurrentProcessorNumber();
+#elif defined(__linux__)
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+// ====================================================================================================
+#ifdef WIN32
+/* As Windows declares it; written out here so that older headers will do */
+struct orbCpuSetInfo
+{
+    DWORD size;
+    DWORD type;
+    DWORD id;
+    WORD group;
+    BYTE logicalProcessorIndex;
+    BYTE coreIndex;
+    BYTE lastLevelCacheIndex;
+    BYTE numaNodeIndex;
+    BYTE efficiencyClass;
+    BYTE flags;
+    DWORD reserved;
+    DWORD64 allocationTag;
+};
+#endif
+
+static void _preferFastCores( struct RunTime *r )
+
+/* Decoding is one thread working flat out, and it has to keep up with the trace. On a processor */
+/* with performance and efficiency cores (Intel 12th generation on) Windows is free to run it on */
+/* an efficiency core, or to treat a console program in the background as low priority work, and */
+/* it then decodes at well under half the speed and falls behind. So: ask not to be throttled,   */
+/* raise the priority a little, and keep the process on the fastest class of core.               */
+
+{
+#ifdef WIN32
+    HMODULE k = GetModuleHandleA( "kernel32.dll" );
+    BOOL ( WINAPI * getSets )( void *, ULONG, PULONG, HANDLE, ULONG ) = ( void * )GetProcAddress( k, "GetSystemCpuSetInformation" );
+    BOOL ( WINAPI * setSets )( HANDLE, const ULONG *, ULONG ) = ( void * )GetProcAddress( k, "SetProcessDefaultCpuSets" );
+    BOOL ( WINAPI * setInfo )( HANDLE, int, void *, DWORD ) = ( void * )GetProcAddress( k, "SetProcessInformation" );
+    static uint8_t buf[64 * 1024];
+    ULONG ids[1024];
+    ULONG len = 0, n = 0, slow = 0;
+    BYTE best = 0;
+
+    SetPriorityClass( GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS );
+
+    if ( setInfo )
+    {
+        /* ProcessPowerThrottling (4): version 1, control EXECUTION_SPEED (1), state 0 = never throttle */
+        ULONG state[3] = { 1, 1, 0 };
+        setInfo( GetCurrentProcess(), 4, state, sizeof( state ) );
+    }
+
+    if ( ( !getSets ) || ( !setSets ) || ( !getSets( buf, sizeof( buf ), &len, GetCurrentProcess(), 0 ) ) )
+    {
+        return;
+    }
+
+    for ( int pass = 0; pass < 2; pass++ )
+    {
+        for ( ULONG o = 0; o + sizeof( struct orbCpuSetInfo ) <= len; )
+        {
+            struct orbCpuSetInfo *c = ( struct orbCpuSetInfo * )&buf[o];
+
+            if ( c->size < 16 )
+            {
+                break;
+            }
+
+            if ( c->type == 0 )
+            {
+                if ( !pass )
+                {
+                    if ( c->efficiencyClass > best )
+                    {
+                        best = c->efficiencyClass;
+                    }
+                }
+                else if ( c->efficiencyClass != best )
+                {
+                    slow++;
+                }
+                else if ( n < sizeof( ids ) / sizeof( ids[0] ) )
+                {
+                    ids[n++] = c->id;
+                }
+            }
+
+            o += c->size;
+        }
+    }
+
+    /* Only worth doing (and only done) when the cores are not all alike */
+    if ( ( slow ) && ( n ) && ( setSets( GetCurrentProcess(), ids, n ) ) )
+    {
+        r->fastCores = ( int )n;
+        r->slowCores = ( int )slow;
+        genericsReport( V_INFO, "Using the %d performance cores, not the %d efficiency cores" EOL, r->fastCores, r->slowCores );
+    }
+
+#else
+    ( void )r;
+#endif
+}
+// ====================================================================================================
 static uint64_t _threadCpuMs( void )
 
 /* Processor time used by the calling thread */
@@ -1775,6 +1890,7 @@ static void _dropSample( struct RunTime *r )
     d->liveMs = r->liveMs;
     d->waitingBlocks = _waitingBlocks( r );
     d->blockMs = ( ( int32_t )( now - r->blockStartMs ) > 0 ) ? now - r->blockStartMs : 0;
+    d->core = r->decodeCore;
 }
 // ====================================================================================================
 static const char *_whereIs( struct RunTime *r, uint32_t addr, char *out, size_t len )
@@ -1906,8 +2022,17 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock, bool fault 
 
     fprintf( f, "\nThe last %d seconds\n-------------------\n", r->sampCount );
     fprintf( f, "Each line is one second. 'cpu' is how much of that second the decoding thread was running:\n" );
-    fprintf( f, "near 1000 ms means it was working flat out, much less means it was waiting or held up.\n\n" );
-    fprintf( f, "    time   received    decoded    waiting      instr   skipped    cpu   live  on block\n" );
+    fprintf( f, "near 1000 ms means it was working flat out, much less means it was waiting or held up.\n" );
+    fprintf( f, "'core' is the processor it was on. If it decodes fewer instructions with the same cpu time, the\n" );
+    fprintf( f, "processor was slower: an efficiency core, or the PC lowering its speed.\n" );
+
+    if ( r->fastCores )
+    {
+        fprintf( f, "The process was restricted to the %d performance cores of this PC (%d efficiency cores not used).\n", r->fastCores, r->slowCores );
+    }
+
+    fprintf( f, "\n" );
+    fprintf( f, "    time   received    decoded    waiting      instr   skipped    cpu   live  on block  core\n" );
     fprintf( f, "       s       MB/s       MB/s         MB        M/s        /s     ms     ms        ms\n" );
 
     for ( int i = 1; i < r->sampCount; i++ )
@@ -1921,10 +2046,10 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock, bool fault 
             continue;
         }
 
-        fprintf( f, "%8.1f %10.1f %10.1f %10.1f %10.1f %9.0f %6.0f %6.0f %9u\n", b->ms / 1000.0,
+        fprintf( f, "%8.1f %10.1f %10.1f %10.1f %10.1f %9.0f %6.0f %6.0f %9u %5d\n", b->ms / 1000.0,
                  ( b->rxBytes - a->rxBytes ) / 1e6 / dt, ( b->decodedBytes - a->decodedBytes ) / 1e6 / dt,
                  b->waitingBlocks * ( TRANSFER_SIZE / 1e6 ), ( b->inst - a->inst ) / 1e6 / dt, ( b->lost - a->lost ) / dt,
-                 ( b->cpuMs - a->cpuMs ) / dt, ( b->liveMs - a->liveMs ) / dt, b->blockMs );
+                 ( b->cpuMs - a->cpuMs ) / dt, ( b->liveMs - a->liveMs ) / dt, b->blockMs, b->core );
     }
 
     fprintf( f, "\nThe trace file\n--------------\n" );
@@ -2136,6 +2261,7 @@ static void *_processBlocks( void *params )
 
         r->decodedBytes += b->fillLevel;
         r->decodeCpuMs = _threadCpuMs();
+        r->decodeCore = _currentCore();
 
 blockDone:
         pthread_mutex_lock( &r->dataForClients_m );
@@ -2332,6 +2458,7 @@ int main( int argc, char *argv[] )
         /* Start the result processing task (once: we may come round here again after a reconnect) */
         if ( !processThreadStarted )
         {
+            _preferFastCores( &_r );
             pthread_create( &_r.processThread, NULL, &_processBlocks, &_r );
             processThreadStarted = true;
         }
