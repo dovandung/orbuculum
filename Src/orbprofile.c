@@ -43,6 +43,8 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 /* How many transfer buffers from the source to allocate */
 #define DEFAULT_BUFFER_MB (1024)         /* Default capture buffer size, can be changed with -b */
 #define MIN_RAW_BLOCKS (4)
+#define HIST_BLOCKS (256)                 /* -X: decoded blocks kept, 64 MiB of trace before the decoder's position */
+#define DROP_SAMPLES (180)                /* -X: seconds of rate history kept */
 #define SPARE_BLOCKS (8)                  /* Emptied capture buffers kept for reuse, the rest are freed */
 
 /* Direct-mapped cache in front of the instruction hash table (decoding looks up every instruction) */
@@ -92,6 +94,7 @@ struct Options                           /* Record for options, either defaults 
     uint32_t timelineMin;                /* Shortest call to put in the timeline, in instructions (or cycles) */
     int  liveInterval;                   /* Live mode: rewrite the coverage file and report this often, in ms (0 = off) */
     int  bufferMB;                       /* Capture buffer size in MiB */
+    char *dropDump;                      /* Stop at the first data loss and write the evidence to <name>.* */
     bool mono;                           /* Supress colour in output */
     bool noaltAddr;                      /* Dont use alternate addressing */
     int  tag;                            /*  Which OFLOW stream are we decoding? */
@@ -145,6 +148,19 @@ struct dataBlock
 };
 
 /* ----------- LIVE STATE ----------------- */
+struct dropSample                               /* State once a second, for the -X report */
+{
+    uint32_t ms;                                /* Since the capture started */
+    uint64_t rxBytes;
+    uint64_t decodedBytes;
+    uint64_t inst;
+    uint64_t lost;
+    uint64_t cpuMs;
+    uint64_t liveMs;
+    uint32_t waitingBlocks;
+    uint32_t blockMs;                           /* How long the decoder has been on its current block */
+};
+
 struct RunTime
 {
     /* Information about the program */
@@ -182,6 +198,20 @@ struct RunTime
     uint64_t rootStart;                         /* ...and when it started, or when the last one ended */
     uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
     volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
+
+    /* For -X: what is needed to work out afterwards why decoding fell behind */
+    struct dataBlock *hist[HIST_BLOCKS];        /* The blocks decoded last, oldest at histHead when full */
+    int histHead;
+    int histCount;
+    volatile bool abandon;                      /* Stop decoding: throw the waiting blocks away */
+    volatile uint64_t decodedBytes;             /* Trace handed to the decoder so far */
+    volatile uint64_t decodeCpuMs;              /* Processor time the decoding thread has used */
+    volatile uint64_t liveMs;                   /* ...and the time it spent writing live results */
+    volatile uint32_t blockStartMs;             /* When the decoder started on its current block */
+    struct dropSample samp[DROP_SAMPLES];       /* One entry a second, most recent at sampHead-1 */
+    int sampHead;
+    int sampCount;
+    uint32_t lastSample;
     uint32_t lastLive;                          /* When the last live update was made */
     uint32_t liveUpdates;                       /* Number of live updates made */
 
@@ -1257,6 +1287,9 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -T, --all-truncate: truncate -d material off all references (i.e. make output relative)" EOL );
     genericsFPrintf( stderr, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
     genericsFPrintf( stderr, "    -V, --version:      Print version and exit" EOL );
+    genericsFPrintf( stderr, "    -X, --stop-on-drop: <name> When trace has to be discarded because decoding fell behind, stop and" EOL );
+    genericsFPrintf( stderr, "                        write <name>.trace (the trace around that point, replay with -f) and" EOL );
+    genericsFPrintf( stderr, "                        <name>.txt (rates over the last minutes and where the decoder was)" EOL );
     genericsFPrintf( stderr, "    -y, --graph-file:   <Filename> dotty filename for structured callgraph output" EOL );
     genericsFPrintf( stderr, "    -z, --cache-file:   <Filename> profile filename for kcachegrind output" EOL );
     genericsFPrintf( stderr, EOL "(Will connect one port higher than that set in -s when Orbflow is not used)" EOL );
@@ -1282,6 +1315,7 @@ static struct option _longOptions[] =
     {"timeline-file", required_argument, NULL, 'g'},
     {"timeline-min", required_argument, NULL, 'G'},
     {"buffer-size", required_argument, NULL, 'b'},
+    {"stop-on-drop", required_argument, NULL, 'X'},
     {"coverage-file", required_argument, NULL, 'c'},
     {"no-colour", no_argument, NULL, 'M'},
     {"no-color", no_argument, NULL, 'M'},
@@ -1306,7 +1340,7 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
     bool serverExplicit = false;
     bool durationSet = false;
 
-    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:g:G:hVI:l:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Ab:c:Dd:e:Ef:g:G:hVI:l:MO:P:p:s:t:Tv:X:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
@@ -1355,6 +1389,11 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
             case 'V':
                 _printVersion();
                 return false;
+
+            // ------------------------------------
+            case 'X':
+                r->options->dropDump = optarg;
+                break;
 
             // ------------------------------------
             case 'b':
@@ -1624,6 +1663,214 @@ static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
     }
 }
 // ====================================================================================================
+static uint64_t _threadCpuMs( void )
+
+/* Processor time used by the calling thread */
+
+{
+#ifdef WIN32
+    FILETIME c, e, k, u;
+
+    if ( !GetThreadTimes( GetCurrentThread(), &c, &e, &k, &u ) )
+    {
+        return 0;
+    }
+
+    return ( ( ( ( uint64_t )k.dwHighDateTime << 32 ) | k.dwLowDateTime ) + ( ( ( uint64_t )u.dwHighDateTime << 32 ) | u.dwLowDateTime ) ) / 10000;
+#else
+    struct timespec ts;
+
+    if ( clock_gettime( CLOCK_THREAD_CPUTIME_ID, &ts ) )
+    {
+        return 0;
+    }
+
+    return ( uint64_t )ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+// ====================================================================================================
+static uint32_t _waitingBlocks( struct RunTime *r )
+
+{
+    return ( uint32_t )( ( r->wp + r->numBlocks - r->rp ) % r->numBlocks );
+}
+// ====================================================================================================
+static void _dropSample( struct RunTime *r )
+
+/* -X: note the state once a second (called from the receiving thread) */
+
+{
+    uint32_t now = genericsTimestampmS();
+    struct dropSample *d;
+
+    if ( ( !r->options->dropDump ) || ( !r->sampling ) || ( now - r->lastSample < 1000 ) )
+    {
+        return;
+    }
+
+    r->lastSample = now;
+    d = &r->samp[r->sampHead];
+    r->sampHead = ( r->sampHead + 1 ) % DROP_SAMPLES;
+
+    if ( r->sampCount < DROP_SAMPLES )
+    {
+        r->sampCount++;
+    }
+
+    d->ms = now - r->starttime;
+    d->rxBytes = r->intervalBytes;
+    d->decodedBytes = r->decodedBytes;
+    d->inst = r->instExecuted;
+    d->lost = _lostInstructions;
+    d->cpuMs = r->decodeCpuMs;
+    d->liveMs = r->liveMs;
+    d->waitingBlocks = _waitingBlocks( r );
+    d->blockMs = now - r->blockStartMs;
+}
+// ====================================================================================================
+static const char *_whereIs( struct RunTime *r, uint32_t addr, char *out, size_t len )
+
+{
+    struct nameEntry n;
+
+    if ( ( addr & SPECIALS_MASK ) == SPECIALS_MASK )
+    {
+        snprintf( out, len, "0x%08" PRIx32 " (not an address: position unknown)", addr );
+    }
+    else if ( SymbolLookup( r->s, addr, &n ) )
+    {
+        snprintf( out, len, "0x%08" PRIx32 " %s, %s:%u", addr, SymbolFunction( r->s, n.functionindex ), SymbolFilename( r->s, n.fileindex ), ( unsigned )n.line );
+    }
+    else
+    {
+        snprintf( out, len, "0x%08" PRIx32 " (not in the ELF file)", addr );
+    }
+
+    return out;
+}
+// ====================================================================================================
+static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
+
+/* -X: decoding fell so far behind that trace has to be discarded. Write what is needed to find */
+/* out why: the trace from 64 MiB before the decoder's position to the newest data received,    */
+/* and a report. Called from the receiving thread; the decoder is still at work, so its state   */
+/* is read as it happens to be.                                                                  */
+
+{
+    char name[1024], where[512];
+    uint64_t before = 0, waiting = 0;
+    uint32_t now = genericsTimestampmS();
+    struct TRACEDecoderStats *st = TRACEDecoderGetStats( &r->i );
+    FILE *f;
+
+    genericsFPrintf( stderr, EOL "Decoding fell behind and trace would be lost: stopping (-X)" EOL );
+
+    /* ---- The trace ---- */
+    snprintf( name, sizeof( name ), "%s.trace", r->options->dropDump );
+    f = fopen( name, "wb" );
+    pthread_mutex_lock( &r->dataForClients_m );
+
+    if ( f )
+    {
+        for ( int i = 0; i < r->histCount; i++ )
+        {
+            struct dataBlock *b = r->hist[( r->histHead + HIST_BLOCKS - r->histCount + i ) % HIST_BLOCKS];
+            before += fwrite( b->buffer, 1, b->fillLevel, f );
+        }
+
+        for ( int i = r->rp; i != r->wp; i = ( i + 1 ) % r->numBlocks )
+        {
+            if ( ( r->rawBlock[i] ) && ( r->rawBlock[i]->fillLevel > 0 ) )
+            {
+                waiting += fwrite( r->rawBlock[i]->buffer, 1, r->rawBlock[i]->fillLevel, f );
+            }
+        }
+
+        if ( rxBlock->fillLevel > 0 )
+        {
+            waiting += fwrite( rxBlock->buffer, 1, rxBlock->fillLevel, f );
+        }
+
+        fclose( f );
+    }
+
+    pthread_mutex_unlock( &r->dataForClients_m );
+
+    /* ---- The report ---- */
+    snprintf( name, sizeof( name ), "%s.txt", r->options->dropDump );
+    f = fopen( name, "w" );
+
+    if ( !f )
+    {
+        genericsReport( V_ERROR, "Could not write %s" EOL, name );
+        return;
+    }
+
+    fprintf( f, "orbprofile stopped because decoding fell behind the trace\n" );
+    fprintf( f, "=========================================================\n\n" );
+    fprintf( f, "Version           : %s\n", GIT_DESCRIBE );
+    fprintf( f, "ELF file          : %s\n", r->options->elffile );
+    fprintf( f, "Trace protocol    : %s, link %s, tag %d\n", TRACEDecodeGetProtocolName( r->options->tProtocol ),
+             ( PROT_OFLOW == r->options->protocol ) ? "OFLOW" : "raw", r->options->tag );
+    fprintf( f, "Capture time      : %.1f s\n", ( now - r->starttime ) / 1000.0 );
+    fprintf( f, "Buffer limit (-b) : %d MiB\n\n", r->options->bufferMB );
+
+    fprintf( f, "Received          : %.1f MB\n", r->intervalBytes / 1e6 );
+    fprintf( f, "Given to decoder  : %.1f MB\n", r->decodedBytes / 1e6 );
+    fprintf( f, "Waiting           : %.1f MB in %u blocks\n", waiting / 1e6, _waitingBlocks( r ) + 1 );
+    fprintf( f, "Instructions      : %" PRIu64 " decoded, %" PRIu64 " skipped (position not known)\n", r->instExecuted, _lostInstructions );
+    fprintf( f, "Decoder sync      : gained %u times, lost %u times\n", st->syncCount, st->lostSyncCount );
+    fprintf( f, "Decoder thread    : %.1f s of processor time, %.1f s of it writing live results\n", r->decodeCpuMs / 1000.0, r->liveMs / 1000.0 );
+    fprintf( f, "Current block     : the decoder has been on it for %u ms\n\n", now - r->blockStartMs );
+
+    fprintf( f, "Where the decoder is\n--------------------\n" );
+    fprintf( f, "Next address      : %s\n", _whereIs( r, r->op.workingAddr, where, sizeof( where ) ) );
+
+    if ( r->op.h )
+    {
+        fprintf( f, "Last instruction  : %s\n", _whereIs( r, r->op.h->addr, where, sizeof( where ) ) );
+    }
+
+    fprintf( f, "Open calls        : %d\n", r->substacklen );
+
+    for ( int i = r->substacklen - 1; ( i >= 0 ) && ( i >= r->substacklen - 12 ); i-- )
+    {
+        fprintf( f, "   %3d  %s\n", i, _whereIs( r, r->substack[i].sig.dst, where, sizeof( where ) ) );
+    }
+
+    fprintf( f, "\nThe last %d seconds\n-------------------\n", r->sampCount );
+    fprintf( f, "Each line is one second. 'cpu' is how much of that second the decoding thread was running:\n" );
+    fprintf( f, "near 1000 ms means it was working flat out, much less means it was waiting or held up.\n\n" );
+    fprintf( f, "    time   received    decoded    waiting      instr   skipped    cpu   live  on block\n" );
+    fprintf( f, "       s       MB/s       MB/s         MB        M/s        /s     ms     ms        ms\n" );
+
+    for ( int i = 1; i < r->sampCount; i++ )
+    {
+        struct dropSample *a = &r->samp[( r->sampHead + DROP_SAMPLES - r->sampCount + i - 1 ) % DROP_SAMPLES];
+        struct dropSample *b = &r->samp[( r->sampHead + DROP_SAMPLES - r->sampCount + i ) % DROP_SAMPLES];
+        double dt = ( b->ms - a->ms ) / 1000.0;
+
+        if ( dt <= 0 )
+        {
+            continue;
+        }
+
+        fprintf( f, "%8.1f %10.1f %10.1f %10.1f %10.1f %9.0f %6.0f %6.0f %9u\n", b->ms / 1000.0,
+                 ( b->rxBytes - a->rxBytes ) / 1e6 / dt, ( b->decodedBytes - a->decodedBytes ) / 1e6 / dt,
+                 b->waitingBlocks * ( TRANSFER_SIZE / 1e6 ), ( b->inst - a->inst ) / 1e6 / dt, ( b->lost - a->lost ) / dt,
+                 ( b->cpuMs - a->cpuMs ) / dt, ( b->liveMs - a->liveMs ) / dt, b->blockMs );
+    }
+
+    fprintf( f, "\nThe trace file\n--------------\n" );
+    fprintf( f, "%s.trace holds %.1f MB: %.1f MB the decoder had already been through, then the block\n", r->options->dropDump, ( before + waiting ) / 1e6, before / 1e6 );
+    fprintf( f, "it was working on (at byte %" PRIu64 "), then everything that was waiting.\n\n", before );
+    fprintf( f, "To decode it again:\n   orbprofile -e <elf> -f %s.trace -E -I 600000%s%s\n", r->options->dropDump,
+             ( PROT_OFLOW == r->options->protocol ) ? "" : " -p ETM", ( r->options->tProtocol == TRACE_PROT_ETM4 ) ? " -P ETM4" : "" );
+    fclose( f );
+
+    genericsFPrintf( stderr, "Wrote %s.trace (%.1f MB) and %s.txt" EOL, r->options->dropDump, ( before + waiting ) / 1e6, r->options->dropDump );
+}
+// ====================================================================================================
 static struct dataBlock _lastResort;            /* For the closing blocks if there is no memory left */
 
 static struct dataBlock *_allocBlock( void )
@@ -1706,7 +1953,8 @@ static void _liveUpdate( struct RunTime *r )
     char tmpName[1024];
     bool have = false;
 
-    r->lastLive = genericsTimestampmS();
+    uint32_t liveStart = genericsTimestampmS();
+    r->lastLive = liveStart;
 
     if ( !HASH_COUNT( r->insthead ) )
     {
@@ -1744,6 +1992,7 @@ static void _liveUpdate( struct RunTime *r )
 
     genericsFPrintf( stderr, "   " );
     fflush( stderr );
+    r->liveMs += genericsTimestampmS() - liveStart;
 }
 // ====================================================================================================
 static void *_processBlocks( void *params )
@@ -1775,6 +2024,14 @@ static void *_processBlocks( void *params )
             break;
         }
 
+        r->blockStartMs = genericsTimestampmS();
+
+        if ( r->abandon )
+        {
+            /* Stopped by -X: what is still waiting has been written to the file instead */
+            goto blockDone;
+        }
+
         if ( r->resync )
         {
             /* Blocks before this one were discarded: wait for the trace to say where it is again. */
@@ -1798,11 +2055,33 @@ static void *_processBlocks( void *params )
             TRACEDecoderPump( &r->i, b->buffer, b->fillLevel, _traceCB, &_r );
         }
 
+        r->decodedBytes += b->fillLevel;
+        r->decodeCpuMs = _threadCpuMs();
+
+blockDone:
         pthread_mutex_lock( &r->dataForClients_m );
         r->rawBlock[r->rp] = NULL;
         r->rp = ( r->rp + 1 ) % r->numBlocks;
 
-        if ( b == &_lastResort )
+        if ( ( r->options->dropDump ) && ( !r->abandon ) && ( b != &_lastResort ) )
+        {
+            /* Keep it for a while: the block it pushes out is the one to reuse or free */
+            struct dataBlock *old = ( r->histCount == HIST_BLOCKS ) ? r->hist[r->histHead] : NULL;
+            r->hist[r->histHead] = b;
+            r->histHead = ( r->histHead + 1 ) % HIST_BLOCKS;
+
+            if ( r->histCount < HIST_BLOCKS )
+            {
+                r->histCount++;
+            }
+
+            b = old;
+        }
+
+        if ( !b )
+        {
+        }
+        else if ( b == &_lastResort )
         {
             b = NULL;
         }
@@ -2028,7 +2307,14 @@ int main( int argc, char *argv[] )
 
                 if ( ( !_r.options->file ) && ( !_queueBlock( &_r, false ) ) )
                 {
-                    if ( _r.options->sampleDuration )
+                    if ( _r.options->dropDump )
+                    {
+                        _dropDump( &_r, rxBlock );
+                        rxBlock->fillLevel = 0;
+                        _r.abandon = true;
+                        _r.ending = true;
+                    }
+                    else if ( _r.options->sampleDuration )
                     {
                         genericsReport( V_WARN, "Capture buffer full after %u ms: stopping capture and decoding what was received" EOL,
                                         _r.sampling ? genericsTimestampmS() - _r.starttime : 0 );
@@ -2045,6 +2331,8 @@ int main( int argc, char *argv[] )
                     }
                 }
             }
+
+            _dropSample( &_r );
 
             /* Stop once the sample interval is over */
             if ( ( _r.options->sampleDuration ) && ( ( volatile bool ) _r.sampling ) &&
