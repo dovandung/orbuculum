@@ -1,4 +1,9 @@
 Version 2.3.0 In progress
+* Windows: a read that completed just as its timeout expired lost its data, so a client of the hub now and then missed a whole Orbflow frame (about 4 KB of trace, with nothing reported). All tools reading from the network or a file with a timeout were affected.
+* orbprofile: trace faults (execution running off the end of one function into the next) are detected, counted on the live line and listed at the end
+* orbprofile: -X <name> stops at the first lost data or trace fault and saves the received data (<name>.trace) and a per-second report (<name>.txt)
+* orbprofile: after dropped data the decoder resyncs at the gap; it could carry on across the gap and count lines that never ran
+* orbprofile (Windows): runs on performance cores and opts out of background throttling, so the decoder keeps up on hybrid processors
 * Support/vscode: tasks, launch and settings files to run the trace tools beside a Cortex-Debug session, and the orb-line-counts extension that shows in the editor how many times each line ran
 * Support/orbtrace_gdb.py: gdb commands trace-back, trace-calls and trace-auto, showing what ran before the program stopped
 * orbmortem: -r resumes capturing by itself when trace returns after a stop, -H sets the hold time, -j writes the source lines of each capture to a file, O (or Shift-Right) opens the line under the cursor with the -C editor command (the key was never wired up)

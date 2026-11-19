@@ -875,6 +875,14 @@ The command line options are;
 
  `-l, --live [Interval]`: Live mode. Capture until CTRL-C (or for `-I` if given), rewriting the coverage file and printing the lines, functions and branches covered so far every [Interval] ms. The profile and call graph are written at the end.
 
+ `-X, --stop-on-drop [Name]`: Stop at the first sign that trace was lost or damaged (capture buffer full, or a trace fault) and save the evidence: `[Name].trace` holds the data received and `[Name].txt` a second-by-second report (data rate, decode rate, backlog, CPU time, processor core) with the position of the fault. Use it with `-l` to leave a long run unattended and know its counts are sound.
+
+A *trace fault* is execution that cannot happen: the decoder running off the end of one function straight into the next one in memory. It means a piece of trace is missing or wrong. Faults are counted on the live line (`FAULTS n`) and the first few are listed at the end, with or without `-X`.
+
+After a gap in the trace the decoder waits for the next synchronisation point before counting again, so lost data cannot be credited to the wrong lines.
+
+On Windows processors with performance and efficiency cores, orbprofile asks to run on the performance cores and not to be throttled when its window is in the background.
+
  `-O, --objdump-opts [options]`: Options to pass directly to objdump
 
  `-p, --protocol [OFLOW|ETM]`: Protocol to communicate with the source. Defaults to OFLOW if `-s` is not set, otherwise raw ETM.
