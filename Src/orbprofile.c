@@ -43,6 +43,7 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
 /* How many transfer buffers from the source to allocate */
 #define DEFAULT_BUFFER_MB (1024)         /* Default capture buffer size, can be changed with -b */
 #define MIN_RAW_BLOCKS (4)
+#define FAULTS_KEPT (8)                   /* Trace faults described in the -X report */
 #define HIST_BLOCKS (256)                 /* -X: decoded blocks kept, 64 MiB of trace before the decoder's position */
 #define DROP_SAMPLES (180)                /* -X: seconds of rate history kept */
 #define SPARE_BLOCKS (8)                  /* Emptied capture buffers kept for reuse, the rest are freed */
@@ -149,6 +150,14 @@ struct dataBlock
 };
 
 /* ----------- LIVE STATE ----------------- */
+struct traceFault                               /* Execution that cannot have happened: see _traceFault */
+{
+    uint32_t from;
+    uint32_t to;
+    uint64_t inst;
+    uint32_t ms;
+};
+
 struct dropSample                               /* State once a second, for the -X report */
 {
     uint32_t ms;                                /* Since the capture started */
@@ -203,6 +212,10 @@ struct RunTime
     struct dataBlock *hist[HIST_BLOCKS];        /* The blocks decoded last, oldest at histHead when full */
     int histHead;
     int histCount;
+    uint64_t traceFaults;                       /* Times execution ran from one function straight into the next */
+    struct traceFault fault[FAULTS_KEPT];       /* The first of them */
+    volatile bool faultStop;                    /* -X: one was found, the receiving thread is to stop and dump */
+    uint64_t faultAtDecoded;                    /* Trace given to the decoder before the block with the first one */
     volatile bool abandon;                      /* Stop decoding: throw the waiting blocks away */
     volatile uint64_t decodedBytes;             /* Trace handed to the decoder so far */
     volatile uint64_t decodeCpuMs;              /* Processor time the decoding thread has used */
@@ -706,6 +719,30 @@ static void _resolveCalls( struct RunTime *r )
     }
 }
 // ====================================================================================================
+static void _traceFault( struct RunTime *r, const struct execEntryHash *from, const struct execEntryHash *to )
+
+/* The decoder has stepped from the last instruction of one function straight on into another.  */
+/* Compiled code does not do that (it returns or branches), so trace was lost or damaged just   */
+/* before and the decoder is off the path the program really took. It finds its place again at  */
+/* the next address in the trace; the instructions in between are counted in the wrong place.   */
+
+{
+    if ( r->traceFaults < FAULTS_KEPT )
+    {
+        struct traceFault *f = &r->fault[r->traceFaults];
+        f->from = from->addr;
+        f->to = to->addr;
+        f->inst = r->instExecuted;
+        f->ms = genericsTimestampmS() - r->starttime;
+    }
+
+    if ( ( !r->traceFaults++ ) && ( r->options->dropDump ) )
+    {
+        r->faultAtDecoded = r->decodedBytes;
+        r->faultStop = true;
+    }
+}
+// ====================================================================================================
 static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycles )
 
 /* Account one instruction (atom), which took 'cycles' (cycle accurate trace, else 0) */
@@ -752,6 +789,12 @@ static void _handleInstruction( struct RunTime *r, bool actioned, uint32_t cycle
     {
         r->op.h->scount++;
         r->lineVisits++;
+
+        if ( ( r->op.h->functionindex != r->op.oldh->functionindex ) &&
+                ( r->op.h->addr == r->op.oldh->addr + ( r->op.oldh->is4Byte ? 4 : 2 ) ) )
+        {
+            _traceFault( r, r->op.oldh, r->op.h );
+        }
     }
 
     /* For branch coverage: a conditional jump that executed (condition passed) was taken */
@@ -844,6 +887,11 @@ static void _runAtoms( struct RunTime *r, uint32_t n, uint32_t disposition )
             {
                 nh->scount++;
                 visits++;
+
+                if ( ( nh->functionindex != h->functionindex ) && ( nh->addr == h->addr + ( h->is4Byte ? 4 : 2 ) ) )
+                {
+                    _traceFault( r, h, nh );
+                }
             }
 
             addr += nh->is4Byte ? 4 : 2;
@@ -1287,9 +1335,10 @@ static void _printHelp( const char *const progName )
     genericsFPrintf( stderr, "    -T, --all-truncate: truncate -d material off all references (i.e. make output relative)" EOL );
     genericsFPrintf( stderr, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
     genericsFPrintf( stderr, "    -V, --version:      Print version and exit" EOL );
-    genericsFPrintf( stderr, "    -X, --stop-on-drop: <name> When trace has to be discarded because decoding fell behind, stop and" EOL );
-    genericsFPrintf( stderr, "                        write <name>.trace (the trace around that point, replay with -f) and" EOL );
-    genericsFPrintf( stderr, "                        <name>.txt (rates over the last minutes and where the decoder was)" EOL );
+    genericsFPrintf( stderr, "    -X, --stop-on-drop: <name> Stop when trace has to be discarded because decoding fell behind, or at" EOL );
+    genericsFPrintf( stderr, "                        the first trace fault (execution running from one function straight into" EOL );
+    genericsFPrintf( stderr, "                        the next), and write <name>.trace (the trace around that point, replay" EOL );
+    genericsFPrintf( stderr, "                        with -f) and <name>.txt (what happened, rates, where the decoder was)" EOL );
     genericsFPrintf( stderr, "    -y, --graph-file:   <Filename> dotty filename for structured callgraph output" EOL );
     genericsFPrintf( stderr, "    -z, --cache-file:   <Filename> profile filename for kcachegrind output" EOL );
     genericsFPrintf( stderr, EOL "(Will connect one port higher than that set in -s when Orbflow is not used)" EOL );
@@ -1725,7 +1774,7 @@ static void _dropSample( struct RunTime *r )
     d->cpuMs = r->decodeCpuMs;
     d->liveMs = r->liveMs;
     d->waitingBlocks = _waitingBlocks( r );
-    d->blockMs = now - r->blockStartMs;
+    d->blockMs = ( ( int32_t )( now - r->blockStartMs ) > 0 ) ? now - r->blockStartMs : 0;
 }
 // ====================================================================================================
 static const char *_whereIs( struct RunTime *r, uint32_t addr, char *out, size_t len )
@@ -1749,7 +1798,7 @@ static const char *_whereIs( struct RunTime *r, uint32_t addr, char *out, size_t
     return out;
 }
 // ====================================================================================================
-static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
+static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock, bool fault )
 
 /* -X: decoding fell so far behind that trace has to be discarded. Write what is needed to find */
 /* out why: the trace from 64 MiB before the decoder's position to the newest data received,    */
@@ -1763,7 +1812,8 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
     struct TRACEDecoderStats *st = TRACEDecoderGetStats( &r->i );
     FILE *f;
 
-    genericsFPrintf( stderr, EOL "Decoding fell behind and trace would be lost: stopping (-X)" EOL );
+    genericsFPrintf( stderr, EOL "%s: stopping (-X)" EOL, fault ? "Trace fault (execution ran from one function straight into the next)" :
+                     "Decoding fell behind and trace would be lost" );
 
     /* ---- The trace ---- */
     snprintf( name, sizeof( name ), "%s.trace", r->options->dropDump );
@@ -1806,7 +1856,7 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
         return;
     }
 
-    fprintf( f, "orbprofile stopped because decoding fell behind the trace\n" );
+    fprintf( f, "orbprofile stopped because %s\n", fault ? "of a trace fault" : "decoding fell behind the trace" );
     fprintf( f, "=========================================================\n\n" );
     fprintf( f, "Version           : %s\n", GIT_DESCRIBE );
     fprintf( f, "ELF file          : %s\n", r->options->elffile );
@@ -1821,7 +1871,23 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
     fprintf( f, "Instructions      : %" PRIu64 " decoded, %" PRIu64 " skipped (position not known)\n", r->instExecuted, _lostInstructions );
     fprintf( f, "Decoder sync      : gained %u times, lost %u times\n", st->syncCount, st->lostSyncCount );
     fprintf( f, "Decoder thread    : %.1f s of processor time, %.1f s of it writing live results\n", r->decodeCpuMs / 1000.0, r->liveMs / 1000.0 );
-    fprintf( f, "Current block     : the decoder has been on it for %u ms\n\n", now - r->blockStartMs );
+    fprintf( f, "Current block     : the decoder has been on it for %u ms\n\n", ( ( int32_t )( now - r->blockStartMs ) > 0 ) ? now - r->blockStartMs : 0 );
+
+    if ( r->traceFaults )
+    {
+        char w2[512];
+        fprintf( f, "Trace faults      : %" PRIu64 "\n", r->traceFaults );
+        fprintf( f, "   Execution ran from the last instruction of one function straight on into another. Compiled\n" );
+        fprintf( f, "   code does not do that, so trace was lost or damaged just before each of these:\n" );
+
+        for ( uint64_t i = 0; ( i < r->traceFaults ) && ( i < FAULTS_KEPT ); i++ )
+        {
+            fprintf( f, "   %8.3f s  after %" PRIu64 " instructions\n              from %s\n              into %s\n", r->fault[i].ms / 1000.0, r->fault[i].inst,
+                     _whereIs( r, r->fault[i].from, where, sizeof( where ) ), _whereIs( r, r->fault[i].to, w2, sizeof( w2 ) ) );
+        }
+
+        fprintf( f, "\n" );
+    }
 
     fprintf( f, "Where the decoder is\n--------------------\n" );
     fprintf( f, "Next address      : %s\n", _whereIs( r, r->op.workingAddr, where, sizeof( where ) ) );
@@ -1863,7 +1929,15 @@ static void _dropDump( struct RunTime *r, struct dataBlock *rxBlock )
 
     fprintf( f, "\nThe trace file\n--------------\n" );
     fprintf( f, "%s.trace holds %.1f MB: %.1f MB the decoder had already been through, then the block\n", r->options->dropDump, ( before + waiting ) / 1e6, before / 1e6 );
-    fprintf( f, "it was working on (at byte %" PRIu64 "), then everything that was waiting.\n\n", before );
+    fprintf( f, "it was working on (at byte %" PRIu64 "), then everything that was waiting.\n", before );
+
+    if ( ( fault ) && ( r->decodedBytes - r->faultAtDecoded <= before ) )
+    {
+        fprintf( f, "The first trace fault is in the block of %d KB that starts at byte %" PRIu64 " of the file.\n",
+                 TRANSFER_SIZE / 1024, before - ( r->decodedBytes - r->faultAtDecoded ) );
+    }
+
+    fprintf( f, "\n" );
     fprintf( f, "To decode it again:\n   orbprofile -e <elf> -f %s.trace -E -I 600000%s%s\n", r->options->dropDump,
              ( PROT_OFLOW == r->options->protocol ) ? "" : " -p ETM", ( r->options->tProtocol == TRACE_PROT_ETM4 ) ? " -P ETM4" : "" );
     fclose( f );
@@ -1989,6 +2063,11 @@ static void _liveUpdate( struct RunTime *r )
     if ( r->droppedBytes )
     {
         genericsFPrintf( stderr, "  DROPPED %.1f MB", ( double )r->droppedBytes / 1e6 );
+    }
+
+    if ( r->traceFaults )
+    {
+        genericsFPrintf( stderr, "  FAULTS %" PRIu64, r->traceFaults );
     }
 
     genericsFPrintf( stderr, "   " );
@@ -2310,7 +2389,7 @@ int main( int argc, char *argv[] )
                 {
                     if ( _r.options->dropDump )
                     {
-                        _dropDump( &_r, rxBlock );
+                        _dropDump( &_r, rxBlock, false );
                         rxBlock->fillLevel = 0;
                         _r.abandon = true;
                         _r.ending = true;
@@ -2337,6 +2416,15 @@ int main( int argc, char *argv[] )
             }
 
             _dropSample( &_r );
+
+            if ( ( _r.faultStop ) && ( !_r.abandon ) )
+            {
+                /* The decoder found a trace fault (-X): save the trace around it and stop */
+                _dropDump( &_r, rxBlock, true );
+                rxBlock->fillLevel = 0;
+                _r.abandon = true;
+                _r.ending = true;
+            }
 
             /* Stop once the sample interval is over */
             if ( ( _r.options->sampleDuration ) && ( ( volatile bool ) _r.sampling ) &&
@@ -2403,6 +2491,20 @@ int main( int argc, char *argv[] )
     {
         genericsReport( V_WARN, "%.1f MB of trace discarded because decoding could not keep up: code that ran in those "
                         "parts can show as not run, and call costs are approximate" EOL, ( double )_r.droppedBytes / 1e6 );
+    }
+
+    if ( _r.traceFaults )
+    {
+        genericsReport( V_WARN, "%" PRIu64 " trace fault%s: execution ran from one function straight into the next, so trace was lost or "
+                        "damaged there and a few instructions are counted in the wrong place%s" EOL, _r.traceFaults, ( _r.traceFaults == 1 ) ? "" : "s",
+                        _r.options->dropDump ? "" : " (use -X to stop at the first and save the trace)" );
+
+        for ( uint64_t i = 0; ( i < _r.traceFaults ) && ( i < FAULTS_KEPT ); i++ )
+        {
+            char w1[512], w2[512];
+            genericsReport( V_WARN, "  after %" PRIu64 " instructions: from %s into %s" EOL, _r.fault[i].inst,
+                            _whereIs( &_r, _r.fault[i].from, w1, sizeof( w1 ) ), _whereIs( &_r, _r.fault[i].to, w2, sizeof( w2 ) ) );
+        }
     }
 
     if ( _lostInstructions )
