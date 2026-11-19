@@ -52,7 +52,6 @@ const char *protString[] = {"OFLOW", "ETM", NULL};
                                         /* (one ETM atom byte covers up to ~16 instructions)         */
 
 #define INTERVAL_TIME_MS    (1000)      /* Intervaltime between acculumator resets */
-#define RUN_MIN_BYTES       (1024)      /* A new run of at least this much trace is shown on its own (-r) */
 #define RESUME_BYTES        (0)         /* Data after an automatic stop above which the trace counts as restarted (-r) */
 #define HANG_TIME_MS        (200)       /* Time without a packet after which we dump the buffer */
 #define TICK_TIME_MS        (100)       /* Time intervals for screen updates and keypress check */
@@ -165,8 +164,6 @@ struct RunTime
     bool held;                          /* If we are actively collecting data */
     bool autoHeld;                      /* ...and it was the trace stopping that held us, not the user */
     uint64_t heldBytes;                 /* Data that has arrived since then */
-    bool     runMarked;                 /* The buffer holds trace from before the last automatic stop... */
-    uint64_t runStartTotal;             /* ...which ended at this count of received bytes */
 
     struct SIOInstance *sio;            /* Our screen IO instance for managed I/O */
 
@@ -2705,42 +2702,13 @@ int main( int argc, char *argv[] )
                     )
                )
             {
-                /* With -r the buffer still holds the run before the last stop. Show only the run that */
-                /* has just ended, when there is a real one: a few late bytes after a stop are not a   */
-                /* run, and then (or if the new run alone cannot be decoded) the older trace is kept.  */
-                uint32_t keptRp = _r.rp;
-                bool trimmed = false;
-                uint64_t runBytes = _r.newTotalBytes - _r.runStartTotal;
-
-                if ( ( _r.runMarked ) && ( runBytes >= RUN_MIN_BYTES ) && ( runBytes < ( uint64_t )_pmLen( &_r ) ) )
-                {
-                    _r.rp = ( _r.wp + _r.options->buflen - ( uint32_t )runBytes ) % _r.options->buflen;
-                    trimmed = true;
-                }
-
-                bool dumped = _dumpBuffer( &_r );
-
-                if ( ( dumped ) && ( trimmed ) && ( !_r.numLines ) )
-                {
-                    _r.rp = keptRp;
-                    trimmed = false;
-                    dumped = _dumpBuffer( &_r );
-                }
-
-                if ( !dumped )
+                if ( !_dumpBuffer( &_r ) )
                 {
                     /* Dumping the buffer failed, so give up */
                     _r.ending = true;
                 }
                 else
                 {
-                    if ( ( trimmed ) || ( !_r.runMarked ) || ( runBytes >= RUN_MIN_BYTES ) )
-                    {
-                        /* A run ended here; late bytes do not move the mark */
-                        _r.runStartTotal = _r.newTotalBytes;
-                    }
-
-                    _r.runMarked = _r.options->autoResume;
                     _r.held = true;
                     _r.autoHeld = true;
                     _r.heldBytes = 0;
