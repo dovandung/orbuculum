@@ -144,6 +144,7 @@ struct opConstruct
 struct dataBlock
 {
     ssize_t fillLevel;
+    bool afterGap;                              /* Trace was discarded just before this block */
     uint8_t buffer[TRANSFER_SIZE];
 };
 
@@ -197,7 +198,6 @@ struct RunTime
     int timeBase;                               /* Timeline clock: 0 not decided yet, 1 instructions, 2 cycles */
     uint64_t rootStart;                         /* ...and when it started, or when the last one ended */
     uint64_t droppedBytes;                      /* Bytes discarded because decoding could not keep up */
-    volatile bool resync;                       /* Data were discarded: the decoder must find sync again */
 
     /* For -X: what is needed to work out afterwards why decoding fell behind */
     struct dataBlock *hist[HIST_BLOCKS];        /* The blocks decoded last, oldest at histHead when full */
@@ -1930,6 +1930,7 @@ static bool _queueBlock( struct RunTime *r, bool force )
     }
 
     nb->fillLevel = 0;
+    nb->afterGap = false;
     r->rawBlock[nwp] = nb;
     r->wp = nwp;
     pthread_cond_signal( &r->dataForClients );
@@ -2032,11 +2033,10 @@ static void *_processBlocks( void *params )
             goto blockDone;
         }
 
-        if ( r->resync )
+        if ( b->afterGap )
         {
             /* Blocks before this one were discarded: wait for the trace to say where it is again. */
             /* The calls that were open can no longer be matched to their returns.                 */
-            r->resync = false;
             TRACEDecoderForceSync( &r->i, false );
             r->op.workingAddr = NO_DESTADDRESS;
             r->op.etm4Pending = false;
@@ -2179,6 +2179,7 @@ int main( int argc, char *argv[] )
     }
 
     _r.rawBlock[0]->fillLevel = 0;
+    _r.rawBlock[0]->afterGap = false;
 
     if ( _r.options->timelineFile )
     {
@@ -2327,7 +2328,10 @@ int main( int argc, char *argv[] )
                         /* finds its place again at the next sync in the trace.                 */
                         _r.droppedBytes += rxBlock->fillLevel;
                         rxBlock->fillLevel = 0;
-                        _r.resync = true;
+
+                        /* The gap is here, in front of what this block receives next: the decoder */
+                        /* must not carry on across it, but everything queued before it is good.   */
+                        rxBlock->afterGap = true;
                     }
                 }
             }
