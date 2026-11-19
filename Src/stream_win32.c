@@ -58,10 +58,22 @@ static enum ReceiveResult _win32StreamReceive( struct Stream *stream, void *buff
 
     if ( waitResult == WAIT_TIMEOUT )
     {
+        /* Give up on this read. It may complete in the moment between the timeout and the cancel   */
+        /* taking effect, and then its data are already in the caller's buffer: they must be handed */
+        /* over, not thrown away with the timeout (which lost a piece of the stream now and then).  */
         CancelIoEx( self->source, &asyncRead );
         WaitForSingleObjectEx( self->readDoneEvent, INFINITE, true );
+        bytesRead = 0;
         GetOverlappedResult( self->source, &asyncRead, &bytesRead, true );
-        return RECEIVE_RESULT_TIMEOUT;
+
+        if ( bytesRead == 0 )
+        {
+            return RECEIVE_RESULT_TIMEOUT;
+        }
+
+        *receivedSize = bytesRead;
+        self->readOffset += bytesRead;
+        return RECEIVE_RESULT_OK;
     }
 
     if ( GetOverlappedResult( self->source, &asyncRead, &bytesRead, true ) == 0 )
