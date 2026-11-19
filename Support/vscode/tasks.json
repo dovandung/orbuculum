@@ -57,7 +57,7 @@
             // Coverage that keeps updating; Coverage Gutters shows it in the editor.
             "label": "Trace: live coverage",
             "type": "shell",
-            "command": "& \"$env:ORB_BIN/orbprofile.exe\" -e '${input:elf}' -c '${workspaceFolder}/coverage.info' -l 1000",
+            "command": "& \"$env:ORB_BIN/orbprofile.exe\" -e '${input:elf}' -c '${workspaceFolder}/coverage.info' -l 1000 -X '${workspaceFolder}/drop'",
             "isBackground": true,
             "problemMatcher": [],
             "presentation": { "panel": "dedicated", "reveal": "always" }
