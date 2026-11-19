@@ -2485,7 +2485,10 @@ int main( int argc, char *argv[] )
                 if ( _r.heldBytes > RESUME_BYTES )
                 {
                     _r.held = _r.autoHeld = false;
-                    _r.wp = _r.rp = 0;
+
+                    /* The trace already captured is kept: the new data follow it in the buffer, so */
+                    /* the next stop shows the history across both runs. Starting from empty lost    */
+                    /* everything when only a few late bytes arrived after a stop (nothing to show). */
 
                     if ( _r.diving )
                     {
