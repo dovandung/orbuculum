@@ -1,5 +1,5 @@
 Version 2.3.0 In progress
-* orbmortem: a capture with no A-sync in it (a single step in a debugger) is decoded from its first I-sync; it showed nothing before
+* orbmortem: a capture with no A-sync in it (a single step in a debugger) is decoded from its first I-sync, when it began after a pause in the trace or is read from a file; it showed nothing before
 * Support/orbtrace_gdb.py: at every stop the end of the trace is pushed out of the target with ITM filler on channels 29 to 31, so short steps reach orbmortem (set orbtrace-flush off)
 * Windows: a read that completed just as its timeout expired lost its data, so a client of the hub now and then missed a whole Orbflow frame (about 4 KB of trace, with nothing reported). All tools reading from the network or a file with a timeout were affected.
 * orbprofile: trace faults (execution running off the end of one function into the next) are detected, counted on the live line and listed at the end

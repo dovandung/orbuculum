@@ -835,7 +835,9 @@ trace, live coverage shown in the editor (Coverage Gutters), and a small extensi
 how many times each line ran. See `Support/vscode/README.md`.
 
 Stepping in the debugger works too. A step over a source line is a few bytes of trace with no A-sync in
-it; orbmortem decodes such a capture from its first I-sync and shows the lines of that step. A parallel
+it; orbmortem decodes such a capture from its first I-sync and shows the lines of that step. It does so only
+for a capture that began after a pause in the trace (as every stop and step does) or that is read from a file,
+so a piece from the middle of a run is never guessed at. A parallel
 trace port keeps an unfinished 16-byte frame until more data arrive, though, so the trace of a step of
 one or two instructions, and the last bytes before any stop, would stay in the target. `orbtrace_gdb.py`
 therefore writes one word each to ITM channels 29 to 31 at every stop, which completes the frame
