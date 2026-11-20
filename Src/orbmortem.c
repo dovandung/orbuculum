@@ -165,6 +165,8 @@ struct RunTime
     bool autoHeld;                      /* ...and it was the trace stopping that held us, not the user */
     uint64_t heldBytes;                 /* Data that has arrived since then */
     int64_t  packetStart;               /* Buffer offset to decode from as packets, with no A-sync before it (-1: none) */
+    bool     afterPause;                /* The capture began after a pause in the trace (or is a file): it starts with whole packets */
+    bool     gotData;                   /* Something has been received since the start */
 
     struct SIOInstance *sio;            /* Our screen IO instance for managed I/O */
 
@@ -1889,9 +1891,12 @@ static bool _dumpBuffer( struct RunTime *r )
     /* only repeats that about every 1000 bytes. But it starts every run with an I-sync, and the  */
     /* bytes of a capture follow one another without a gap, so such a capture can be decoded from  */
     /* its first I-sync on. Without this a step over one source line showed nothing.               */
+    /* Two signs are wanted together: the capture began after a pause in the trace, so it is the   */
+    /* start of a run and not a piece from the middle of one (where other bytes can look like an   */
+    /* I-sync), and the bytes of an I-sync that gives a reason.                                     */
     r->packetStart = -1;
 
-    if ( ( r->options->traceProt == TRACE_PROT_ETM35 ) && ( len >= 6 ) && ( _syncAtOrBefore( r, len ) < 0 ) )
+    if ( ( r->afterPause ) && ( r->options->traceProt == TRACE_PROT_ETM35 ) && ( len >= 6 ) && ( _syncAtOrBefore( r, len ) < 0 ) )
     {
         for ( int64_t p = 0; p + 2 < len; p++ )
         {
@@ -2377,6 +2382,7 @@ int main( int argc, char *argv[] )
 
     /* Fill in a time to start from */
     lastHTime = lastTTime = lastTSTime = genericsTimestampmS();
+    uint32_t startTime = genericsTimestampmS();
 
 
 #if !defined( WIN32 )
@@ -2447,6 +2453,9 @@ int main( int argc, char *argv[] )
 
                 if ( stream )
                 {
+                    /* Whether the first data follow a pause is judged from this connection on */
+                    startTime = genericsTimestampmS();
+                    _r.gotData = false;
                     break;
                 }
 
@@ -2475,6 +2484,14 @@ int main( int argc, char *argv[] )
             {
                 /* We always read the data, even if we're held, to keep the socket alive */
                 enum ReceiveResult result = stream->receive( stream, _r.rawBlock.buffer, TRANSFER_SIZE, &tv, ( size_t * )&_r.rawBlock.fillLevel );
+
+                if ( ( !_r.gotData ) && ( _r.rawBlock.fillLevel > 0 ) )
+                {
+                    /* The first data: a file is a capture from its beginning; a live stream is the */
+                    /* start of a run only if nothing came for a while before it                    */
+                    _r.gotData = true;
+                    _r.afterPause = ( _r.options->file != NULL ) || ( ( genericsTimestampmS() - startTime ) > ( uint32_t )_r.options->hangTime );
+                }
 
                 /* Try to re-establish socket if there was an error */
                 if ( result == RECEIVE_RESULT_ERROR )
@@ -2509,6 +2526,7 @@ int main( int argc, char *argv[] )
                 {
                     _r.held = _r.autoHeld = false;
                     _r.wp = _r.rp = 0;
+                    _r.afterPause = true;       /* Held because the trace stopped, and now it is back */
 
                     if ( _r.diving )
                     {
@@ -2571,6 +2589,7 @@ int main( int argc, char *argv[] )
                         if ( !_r.held )
                         {
                             _r.wp = _r.rp = 0;
+                            _r.afterPause = false;      /* Released by hand: the trace may be in full flow */
 
                             if ( _r.options->holdAt )
                             {
