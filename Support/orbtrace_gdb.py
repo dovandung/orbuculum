@@ -18,8 +18,8 @@ halts the CPU. This script reads the file.
 The end of the trace at a stop: a parallel trace port sends frames of 16 bytes and keeps an
 unfinished one until more data arrive, so the last few bytes before a stop stay in the chip, and
 a step over one source line may send nothing at all. At every stop this script therefore writes
-a few words to ITM channel 31 through the debugger; they fill the frame and the waiting trace
-comes out. Nothing is done when the ITM is off. The words appear on channel 31 only.
+one word each to ITM channels 29, 30 and 31 through the debugger; they fill the frame and the
+waiting trace comes out. Nothing is done when the ITM is off. The words appear on those channels only.
 
 Lines are printed as file:line, which VS Code turns into links. Needs a gdb built with Python.
 """
@@ -54,11 +54,18 @@ _journal = _Journal()
 _flush = _Flush()
 
 _ITM_STIM, _ITM_TER, _ITM_TCR, _ITM_LAR = 0xE0000000, 0xE0000E00, 0xE0000E80, 0xE0000FB0
-_FLUSH_CHANNEL, _FLUSH_WORDS = 31, 8            # 8 words are 40 bytes of ITM: two frames and more
+_FLUSH_FIRST, _FLUSH_COUNT = 29, 3              # ITM channels 29..31: one word each, 15 bytes in all
+_FLUSH_MASK = ((1 << _FLUSH_COUNT) - 1) << _FLUSH_FIRST
 
 
 def _push_trace_out():
-    """Complete the trace port's unfinished frame with ITM filler (see the top of this file)."""
+    """Complete the trace port's unfinished frame with ITM filler (see the top of this file).
+
+    A frame holds 15 bytes and the unfinished one has at least one in it, so 15 bytes of filler
+    always complete it. They go out as one write over three channels, and the channel enables are
+    only looked at, not written, once they are set: two accesses to the target per stop, because
+    each one costs a few milliseconds through a debug probe and stepping should stay quick.
+    """
     try:
         inf = gdb.selected_inferior()
 
@@ -68,16 +75,18 @@ def _push_trace_out():
         def wr(addr, value):
             inf.write_memory(addr, value.to_bytes(4, "little"))
 
-        if not rd(_ITM_TCR) & 1:
-            return                               # ITM off: trace is not set up, leave it alone
         ter = rd(_ITM_TER)
-        if not (ter >> _FLUSH_CHANNEL) & 1:
+        if (ter & _FLUSH_MASK) != _FLUSH_MASK:
+            # First stop after the firmware set the ITM up (it rewrites the enables)
+            if not rd(_ITM_TCR) & 1:
+                return                           # ITM off: trace is not set up, leave it alone
             wr(_ITM_LAR, 0xC5ACCE55)
-            wr(_ITM_TER, ter | (1 << _FLUSH_CHANNEL))
-        for _ in range(_FLUSH_WORDS):
-            wr(_ITM_STIM + 4 * _FLUSH_CHANNEL, 0)
+            wr(_ITM_TER, ter | _FLUSH_MASK)
+        inf.write_memory(_ITM_STIM + 4 * _FLUSH_FIRST, bytes(4 * _FLUSH_COUNT))
     except (gdb.error, RuntimeError):
         pass                                     # no target, or memory not reachable: not our business
+
+
 _state = {"auto": 0, "stopped": 0.0}
 
 
