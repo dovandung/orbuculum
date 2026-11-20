@@ -164,6 +164,7 @@ struct RunTime
     bool held;                          /* If we are actively collecting data */
     bool autoHeld;                      /* ...and it was the trace stopping that held us, not the user */
     uint64_t heldBytes;                 /* Data that has arrived since then */
+    int64_t  packetStart;               /* Buffer offset to decode from as packets, with no A-sync before it (-1: none) */
 
     struct SIOInstance *sio;            /* Our screen IO instance for managed I/O */
 
@@ -1589,7 +1590,8 @@ static void _decodeRange( struct RunTime *r, int64_t from, int64_t to )
 /* the start of the buffer), so the decoder and the flow state start afresh.                   */
 
 {
-    TRACEDecoderForceSync( &r->i, false );
+    /* A capture with no A-sync in it is decoded from its first I-sync, as packets (see _dumpBuffer) */
+    TRACEDecoderForceSync( &r->i, ( from == r->packetStart ) );
     r->op.currentLine = NO_LINE;
     r->op.currentFileindex = NO_FILE;
     r->op.currentFunctionptr = NULL;
@@ -1883,6 +1885,27 @@ static bool _dumpBuffer( struct RunTime *r )
     int64_t len = _pmLen( r );
     int64_t start = 0;
 
+    /* A short run, such as a single step in a debugger, sends a few bytes and no A-sync: the ETM */
+    /* only repeats that about every 1000 bytes. But it starts every run with an I-sync, and the  */
+    /* bytes of a capture follow one another without a gap, so such a capture can be decoded from  */
+    /* its first I-sync on. Without this a step over one source line showed nothing.               */
+    r->packetStart = -1;
+
+    if ( ( r->options->traceProt == TRACE_PROT_ETM35 ) && ( len >= 6 ) && ( _syncAtOrBefore( r, len ) < 0 ) )
+    {
+        for ( int64_t p = 0; p + 2 < len; p++ )
+        {
+            /* I-sync header, information byte with a reason (tracing started, overflow, or left */
+            /* debug state) and bit 0 set, then a Thumb address                                  */
+            if ( ( _pmByte( r, p ) == 0x08 ) && ( ( _pmByte( r, p + 1 ) & 0x81 ) == 0x01 ) &&
+                    ( _pmByte( r, p + 1 ) & 0x60 ) && ( _pmByte( r, p + 2 ) & 1 ) )
+            {
+                r->packetStart = start = p;
+                break;
+            }
+        }
+    }
+
     /* MTB has no sync points to start decoding at, so it is always decoded whole */
     if ( ( r->options->traceProt != TRACE_PROT_MTB ) && ( len > r->options->window ) )
     {
@@ -1890,7 +1913,7 @@ static bool _dumpBuffer( struct RunTime *r )
 
         if ( start < 0 )
         {
-            start = 0;
+            start = ( r->packetStart >= 0 ) ? r->packetStart : 0;
         }
     }
 
